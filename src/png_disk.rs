@@ -2,13 +2,13 @@
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use std::io::{self, Result};
 use std::path::PathBuf;
+use std::collections::HashSet;
 use image::RgbImage;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce
 };
 use rand::{Rng, SeedableRng};
-use rand::seq::SliceRandom;
 use rand_chacha::ChaCha20Rng;
 use log::{info, debug, warn};
 use argon2::{
@@ -16,16 +16,108 @@ use argon2::{
     Argon2
 };
 
-// 16 bytes (128 bits) for Salt.
-// Stored in first 128 channels linearly (approx 43 pixels).
-const HEADER_BITS: usize = 128;
+// 16 bytes (128 bits) for the Header/Salt.
+const SALT_BITS: usize = 128;
+// Static domain separator used to derive the *location* of the salt from the password.
+const LOCATION_SALT: &str = "MirageLocSalt";
+
+// --- Dynamic Feistel Permutator ---
+// A bijective function that maps index -> index pseudo-randomly.
+// It adapts its bit-width to the image size to ensure O(1) performance
+// via efficient Cycle Walking.
+struct FeistelPermutator {
+    rounds: u32,
+    keys: [u32; 4],
+    max_range: u32,
+    // Dynamic bit-width parameters
+    half_bits: u32,
+    mask: u32,
+}
+
+impl FeistelPermutator {
+    fn new(key: &[u8; 32], max_range: u32) -> Self {
+        let k0 = u32::from_le_bytes(key[0..4].try_into().unwrap());
+        let k1 = u32::from_le_bytes(key[4..8].try_into().unwrap());
+        let k2 = u32::from_le_bytes(key[8..12].try_into().unwrap());
+        let k3 = u32::from_le_bytes(key[12..16].try_into().unwrap());
+
+        // Calculate the smallest even bit-width that covers max_range.
+        // e.g. range=100 -> bits=7 -> bump to 8. range=3000 -> bits=12.
+        let mut bits = 32 - max_range.leading_zeros();
+        if bits % 2 != 0 {
+            bits += 1;
+        }
+        // If exact power of 2, leading_zeros might undershoot, ensure safety:
+        if (1 << bits) < max_range {
+            bits += 2;
+        }
+
+        // Cap at 32 to prevent overflow (though max_range is u32)
+        if bits > 32 { bits = 32; }
+
+        let half_bits = bits / 2;
+        let mask = (1 << half_bits) - 1;
+
+        FeistelPermutator {
+            rounds: 4,
+            keys: [k0, k1, k2, k3],
+            max_range,
+            half_bits,
+            mask,
+        }
+    }
+
+    #[inline(always)]
+    fn round_func(val: u32, key: u32) -> u32 {
+        // Simple integer mixing function (Murmur3-style)
+        let mut x = val.wrapping_mul(0xcc9e2d51);
+        x = x.rotate_left(15);
+        x = x.wrapping_mul(0x1b873593);
+        x ^ key
+    }
+
+    fn permute(&self, index: u32) -> u32 {
+        let mut current = index;
+
+        loop {
+            // Split into L/R based on dynamic width
+            let mut left = (current >> self.half_bits) & self.mask;
+            let mut right = current & self.mask;
+
+            for i in 0..self.rounds {
+                let key = self.keys[i as usize];
+                let f_out = Self::round_func(right, key);
+
+                // Feistel Swap: L = R, R = L ^ f(R)
+                let new_right = left ^ (f_out & self.mask);
+                left = right;
+                right = new_right;
+            }
+
+            // Recombine
+            let result = (left << self.half_bits) | right;
+
+            // Cycle Walking:
+            // Since our bit-width is the smallest even power of 2 covering the range,
+            // we will statistically land inside `max_range` > 50% of the time.
+            if result < self.max_range {
+                return result;
+            }
+
+            // If result is out of bounds, encrypt it again.
+            current = result;
+        }
+    }
+}
 
 pub struct PngDisk {
     img: RgbImage,
     path: PathBuf,
     cipher: ChaCha20Poly1305,
-    // Maps Logical Bit Index -> Physical Channel Index (Flat Index)
-    bit_map: Vec<u32>,
+    permutator: FeistelPermutator,
+    // Cache the salt locations to prevent writing data over the header.
+    // This uses negligible memory (fixed 128 integers).
+    salt_indices: HashSet<u32>,
 }
 
 impl PngDisk {
@@ -38,41 +130,46 @@ impl PngDisk {
         let height = img.height();
         let total_channels = (width as usize) * (height as usize) * 3;
 
-        // Reserve space for Header
-        if total_channels < HEADER_BITS + 4096 {
+        // Ensure image can hold Salt + at least 1 block
+        if total_channels < SALT_BITS + 4096 {
             return Err(io::Error::new(io::ErrorKind::Other, "Image too small for MirageFS"));
         }
 
+        // 1. Locate Salt (Password Derived)
+        // Without the password, we don't even know WHICH pixels are the header.
+        debug!("Deriving salt locations...");
+        let loc_seed = Self::derive_location_seed(password)?;
+        let salt_vec = Self::generate_salt_indices(loc_seed, total_channels as u32);
+        let salt_indices: HashSet<u32> = salt_vec.iter().cloned().collect();
+
         let mut salt = [0u8; 16];
 
-        // 1. Handle Header (Linear Read/Write in first 128 channels)
+        // 2. Read or Write Salt
         if format {
-            info!("PNG: Formatting new volume (PRNG Scatter Mode)...");
-            // Generate new Salt
+            info!("PNG: Formatting (Algorithmic Scatter Mode)...");
             let mut rng = rand::thread_rng();
             rng.fill(&mut salt);
             info!("Generated Salt: {}", hex::encode(salt));
 
-            // Write Salt to Image (Bits 0..128)
-            let header_bits_vec = Self::bytes_to_bits(&salt);
-            for (i, &bit) in header_bits_vec.iter().enumerate() {
-                Self::write_channel_lsb(&mut img, i as u32, bit);
+            let salt_bits = Self::bytes_to_bits(&salt);
+            for (i, &bit) in salt_bits.iter().enumerate() {
+                Self::write_channel_lsb(&mut img, salt_vec[i], bit);
             }
         } else {
-            // Read Salt from Image (Bits 0..128)
-            let mut header_bits_vec = Vec::with_capacity(HEADER_BITS);
-            for i in 0..HEADER_BITS {
-                header_bits_vec.push(Self::read_channel_lsb(&img, i as u32));
+            let mut salt_bits = Vec::with_capacity(SALT_BITS);
+            for idx in &salt_vec {
+                salt_bits.push(Self::read_channel_lsb(&img, *idx));
             }
-            let salt_vec = Self::bits_to_bytes(&header_bits_vec);
-            salt.copy_from_slice(&salt_vec[0..16]);
+            let salt_bytes = Self::bits_to_bytes(&salt_bits);
+            salt.copy_from_slice(&salt_bytes[0..16]);
             info!("Read Salt:      {}", hex::encode(salt));
         }
 
-        // 2. Derive Key
-        debug!("Deriving key...");
+        // 3. Derive Main Key (Key = Argon2(Pass + Salt))
+        debug!("Deriving main key...");
         let salt_string = SaltString::encode_b64(&salt)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         let argon2 = Argon2::default();
         let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -84,33 +181,66 @@ impl PngDisk {
         let key = Key::from_slice(&key_buffer);
         let cipher = ChaCha20Poly1305::new(key);
 
-        // 3. Generate Coordinate Map (The "Scatter" Logic)
-        // We use the derived key to seed a CSPRNG.
-        // We then create a list of ALL available channel indices (skipping header)
-        // and shuffle them. This creates a unique, deterministic scatter pattern.
+        // 4. Initialize Permutator
+        // This math engine replaces the massive Vec<u32> map.
+        let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
 
-        info!("Generating Scatter Map...");
-        let _available_channels = total_channels - HEADER_BITS;
-        let mut bit_map: Vec<u32> = (HEADER_BITS as u32 .. total_channels as u32).collect();
+        let disk = PngDisk { img, path, cipher, permutator, salt_indices };
 
-        // Seed RNG from Key (Deterministic Shuffle)
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&key_buffer);
-        let mut shuffler = ChaCha20Rng::from_seed(seed);
-
-        bit_map.shuffle(&mut shuffler);
-
-        let disk = PngDisk { img, path, cipher, bit_map };
-
-        // 4. Integrity Check (Block 0)
+        // 5. Integrity Check
         if !format {
             if let Err(e) = disk.read_block(0) {
                 warn!("Block 0 Verify Failed: {}", e);
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Auth Tag Mismatch"));
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed (Auth Tag Mismatch)"));
             }
         }
 
         Ok(disk)
+    }
+
+    // --- Core Helpers ---
+
+    fn derive_location_seed(password: &str) -> io::Result<[u8; 32]> {
+        let salt_string = SaltString::encode_b64(LOCATION_SALT.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let argon2 = Argon2::default();
+        let hash = argon2.hash_password(password.as_bytes(), &salt_string)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let output = hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Loc Hash failed"))?;
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&output.as_bytes()[0..32]);
+        Ok(seed)
+    }
+
+    fn generate_salt_indices(seed: [u8; 32], max_range: u32) -> Vec<u32> {
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let mut indices = Vec::with_capacity(SALT_BITS);
+        let mut used = HashSet::new();
+        while indices.len() < SALT_BITS {
+            let idx = rng.gen_range(0..max_range);
+            if used.insert(idx) {
+                indices.push(idx);
+            }
+        }
+        indices
+    }
+
+    // --- Logical to Physical Mapping ---
+
+    // logical_index -> Feistel Permutation -> Physical Index
+    // If Physical Index hits a Salt location -> Re-Permute (Cycle Walk)
+    #[inline(always)]
+    fn map_logical_to_physical(&self, logical_index: u32) -> u32 {
+        let mut physical = self.permutator.permute(logical_index);
+
+        // Collision Resolution:
+        // If the permuted index lands on a Salt pixel, we must skip it.
+        // We re-permute the output to jump to a new random location.
+        // Since salt is tiny (128) vs Image (Millions), this loop virtually never repeats.
+        while self.salt_indices.contains(&physical) {
+            physical = self.permutator.permute(physical);
+        }
+        physical
     }
 
     // --- Low Level Pixel Access ---
@@ -136,8 +266,6 @@ impl PngDisk {
         img.put_pixel(x, y, p);
     }
 
-    // --- Helper Utils ---
-
     fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
         let mut bits = Vec::with_capacity(bytes.len() * 8);
         for byte in bytes {
@@ -161,30 +289,31 @@ impl PngDisk {
 
 impl BlockDevice for PngDisk {
     fn block_count(&self) -> u64 {
-        let total_bits = self.bit_map.len() as u64;
-        let block_bits = (ENCRYPTED_BLOCK_SIZE * 8) as u64;
-        total_bits / block_bits
+        let total_channels = self.permutator.max_range as u64;
+        let available_bits = total_channels.saturating_sub(SALT_BITS as u64);
+        available_bits / (ENCRYPTED_BLOCK_SIZE as u64 * 8)
     }
 
     fn read_block(&self, index: u32) -> Result<[u8; BLOCK_SIZE]> {
-        let start_bit_idx = (index as usize) * ENCRYPTED_BLOCK_SIZE * 8;
-        let end_bit_idx = start_bit_idx + (ENCRYPTED_BLOCK_SIZE * 8);
+        let start_bit = (index as usize) * ENCRYPTED_BLOCK_SIZE * 8;
+        let end_bit = start_bit + (ENCRYPTED_BLOCK_SIZE * 8);
 
-        if end_bit_idx > self.bit_map.len() {
-            return Ok([0u8; BLOCK_SIZE]); // Uninitialized/Out of bounds
+        // Bounds Check
+        if end_bit as u64 > self.block_count() * (ENCRYPTED_BLOCK_SIZE as u64 * 8) {
+            return Ok([0u8; BLOCK_SIZE]);
         }
 
-        // 1. Gather scattered bits
+        // 1. Gather scattered bits using O(1) Permutation
         let mut raw_bits = Vec::with_capacity(ENCRYPTED_BLOCK_SIZE * 8);
-        for i in start_bit_idx..end_bit_idx {
-            let physical_idx = self.bit_map[i];
+        for logical_idx in start_bit..end_bit {
+            let physical_idx = self.map_logical_to_physical(logical_idx as u32);
             raw_bits.push(Self::read_channel_lsb(&self.img, physical_idx));
         }
 
-        // 2. Reconstruct Packet
+        // 2. Reconstruct
         let encrypted_packet = Self::bits_to_bytes(&raw_bits);
         if encrypted_packet.len() != ENCRYPTED_BLOCK_SIZE {
-            return Err(io::Error::new(io::ErrorKind::Other, "Bit/Byte Alignment Error"));
+            return Err(io::Error::new(io::ErrorKind::Other, "Alignment Error"));
         }
 
         // 3. Decrypt
@@ -202,10 +331,10 @@ impl BlockDevice for PngDisk {
     }
 
     fn write_block(&mut self, index: u32, data: &[u8; BLOCK_SIZE]) -> Result<()> {
-        let start_bit_idx = (index as usize) * ENCRYPTED_BLOCK_SIZE * 8;
-        let end_bit_idx = start_bit_idx + (ENCRYPTED_BLOCK_SIZE * 8);
+        let start_bit = (index as usize) * ENCRYPTED_BLOCK_SIZE * 8;
+        let end_bit = start_bit + (ENCRYPTED_BLOCK_SIZE * 8);
 
-        if end_bit_idx > self.bit_map.len() {
+        if end_bit as u64 > self.block_count() * (ENCRYPTED_BLOCK_SIZE as u64 * 8) {
             return Err(io::Error::new(io::ErrorKind::Other, "Disk Full"));
         }
 
@@ -224,7 +353,8 @@ impl BlockDevice for PngDisk {
         // 2. Scatter Bits
         let bits = Self::bytes_to_bits(&packet);
         for (i, bit) in bits.iter().enumerate() {
-            let physical_idx = self.bit_map[start_bit_idx + i];
+            let logical_idx = (start_bit + i) as u32;
+            let physical_idx = self.map_logical_to_physical(logical_idx);
             Self::write_channel_lsb(&mut self.img, physical_idx, *bit);
         }
 

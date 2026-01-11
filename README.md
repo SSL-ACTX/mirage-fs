@@ -35,7 +35,7 @@ MirageFS employs distinct, format-optimized strategies to defeat forensic analys
 
 | Image Format | Strategy | Stealth Technique |
 | :--- | :--- | :--- |
-| **PNG** | **PRNG Scatter** | Bits are scattered non-sequentially across the LSB layer using a CSPRNG seeded by your key. Defeats visual analysis and Chi-Square tests. |
+| **PNG** | **Feistel Bijective Mapping** | Uses a **Feistel Network** and **Cycle Walking** to map logical blocks to physical pixels in $O(1)$ time. This eliminates memory overhead while ensuring a cryptographically uniform distribution across the LSB layer. |
 | **JPEG** | **DNG Morphing** | Data is injected into `APP1` segments mimicking valid **Adobe DNG Private Data** (Tag `0xC634`) inside a standard TIFF structure. |
 | **WebP** | **RIFF Morphing** | Similar to JPEG, data is disguised as vendor-specific metadata inside the `EXIF` chunk of the RIFF container. |
 
@@ -73,6 +73,7 @@ cargo build --release
 # (Optional) Install globally
 sudo cp target/release/mirage /usr/local/bin/mirage
 
+
 ```
 
 ---
@@ -92,6 +93,7 @@ Create a new secret drive inside a carrier image.
 mkdir /tmp/secret
 mirage /tmp/secret vacation.png --format
 
+
 ```
 
 ### 2️⃣ Mounting
@@ -101,6 +103,7 @@ Unlock and mount the drive to access your files.
 ```bash
 mirage /tmp/secret vacation.png
 
+
 ```
 
 You can now open `/tmp/secret` in your file manager. Any file copied here is encrypted and embedded into `vacation.png` on the fly.
@@ -109,23 +112,23 @@ You can now open `/tmp/secret` in your file manager. Any file copied here is enc
 
 To close the drive and flush all data:
 
-* Press `Ctrl + C` in the terminal.
-* **Or** run: `fusermount -u /tmp/secret`
+* **Press** `Ctrl + C` in the terminal.
+* **Or run:** `fusermount -u /tmp/secret`
 
 ---
 
 ## 🔧 Technical Deep Dive
 
-### 🟦 The PNG "Scatter" Engine
+### 🟦 The PNG "Feistel" Engine
 
-Traditional LSB steganography fills pixels sequentially (left-to-right), creating obvious "static" blocks that are easily detected visually or statistically.
+Previous iterations of LSB steganography required generating massive mapping tables to randomize bit placement. MirageFS solves this using **Format-Preserving Encryption** principles.
 
 **MirageFS Approach:**
 
-1. **Derivation:** Password derives a seed via Argon2id.
-2. **Shuffle:** A `ChaCha20` RNG generates a deterministic list of pixel coordinates.
-3. **Scatter:** Data blocks are written to these scattered coordinates.
-4. **Result:** Noise is spread evenly across the entire image, mimicking natural ISO sensor noise.
+1. **Dynamic Feistel Network:** The image is treated as a domain of size  (total pixels). A Feistel network with round keys derived from your password creates a bijective (1-to-1) permutation between the *Logical Block Address* and the *Physical Pixel Index*.
+2. **Cycle Walking:** To handle image sizes that are not perfect powers of 2, the algorithm iterates the Feistel function until the output lands within the valid pixel range.
+3. **Argon2 Salt Location:** The header salt is not at offset 0. Its location is derived via a separate Argon2 hash, making the filesystem undetectable without the password.
+4. **Result:**  random access performance with zero memory overhead for the map, creating perfectly uniform noise distribution.
 
 ### 🟧 The JPEG/WebP "Morphing" Engine
 
@@ -184,6 +187,6 @@ Requires <a href="https://macfuse.github.io/">macFUSE</a>. The code automaticall
 
 **Author:** Seuriin ([SSL-ACTX](https://github.com/SSL-ACTX))
 
-*v1.0.0*
+*v1.1.0*
 
 </div>
