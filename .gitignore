@@ -3,7 +3,6 @@ test/
 tests/
 target/
 
-*.lock
 *.jpeg
 *.jpg
 *.png
