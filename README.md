@@ -3,14 +3,14 @@
 ![MirageFS Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:FF4500&height=220&section=header&text=MirageFS&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=2&stroke=FF4500&strokeWidth=2&desc=The%20Invisible%20Filesystem&descSize=20&descAlignY=60)
 
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.2.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
 
 **Mount encrypted, hidden storage inside innocent image files.**
 
-[Installation](#-installation) • [Usage](#-usage) • [Technical Details](#-technical-deep-dive) • [Disclaimer](#-disclaimer)
+[Installation](#-installation) • [Usage](#-usage) • [RAID Support](#-raid-0-striping) • [Technical Details](#-technical-deep-dive) • [Disclaimer](#-disclaimer)
 
 </div>
 
@@ -30,12 +30,17 @@ Your data is secured with state-of-the-art authenticated encryption.
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
 
+### ⛓️ Multi-Image RAID 0
+MirageFS supports **Stripe-Level Steganography**. You can combine multiple images into a single logical volume.
+* **Entropy Dilution:** A large file is fragmented across multiple carriers. Storing a 10MB file across 5 images results in only 2MB of modifications per image, significantly lowering the forensic "heat signature."
+* **Uniform Growth:** All carriers grow at the same rate, preventing one suspiciously large file among small ones.
+
 ### 🥷 Advanced Steganography
 MirageFS employs distinct, format-optimized strategies to defeat forensic analysis.
 
 | Image Format | Strategy | Stealth Technique |
 | :--- | :--- | :--- |
-| **PNG** | **Feistel Bijective Mapping** | Uses a **Feistel Network** and **Cycle Walking** to map logical blocks to physical pixels in $O(1)$ time. This eliminates memory overhead while ensuring a cryptographically uniform distribution across the LSB layer. |
+| **PNG** | **Feistel Bijective Mapping** | Uses a **Feistel Network** and **Cycle Walking** to map logical blocks to physical pixels in $O(1)$ time. Salt locations are derived from the password, making the volume header invisible without the key. |
 | **JPEG** | **DNG Morphing** | Data is injected into `APP1` segments mimicking valid **Adobe DNG Private Data** (Tag `0xC634`) inside a standard TIFF structure. |
 | **WebP** | **RIFF Morphing** | Similar to JPEG, data is disguised as vendor-specific metadata inside the `EXIF` chunk of the RIFF container. |
 
@@ -73,7 +78,6 @@ cargo build --release
 # (Optional) Install globally
 sudo cp target/release/mirage /usr/local/bin/mirage
 
-
 ```
 
 ---
@@ -82,17 +86,19 @@ sudo cp target/release/mirage /usr/local/bin/mirage
 
 ### 1️⃣ Formatting (Destructive)
 
-Create a new secret drive inside a carrier image.
+Create a new secret drive inside a carrier image (or multiple images).
 
 > [!WARNING]
 > This overwrites any data previously hidden in the image. It does **not** destroy the visible image itself, but modifies the internal bit structure.
 
 ```bash
-# Syntax: mirage <MOUNT_POINT> <IMAGE_FILE> --format
+# Syntax: mirage <MOUNT_POINT> <IMAGE_FILES...> --format
 
-mkdir /tmp/secret
+# Single Image Mode
 mirage /tmp/secret vacation.png --format
 
+# RAID 0 Mode (Split data across multiple images)
+mirage /tmp/secret part1.jpg part2.png part3.webp --format
 
 ```
 
@@ -101,12 +107,12 @@ mirage /tmp/secret vacation.png --format
 Unlock and mount the drive to access your files.
 
 ```bash
-mirage /tmp/secret vacation.png
-
+# Must specify the same images in the same order!
+mirage /tmp/secret part1.jpg part2.png part3.webp
 
 ```
 
-You can now open `/tmp/secret` in your file manager. Any file copied here is encrypted and embedded into `vacation.png` on the fly.
+You can now open `/tmp/secret` in your file manager. Any file copied here is encrypted, fragmented, and embedded into the carrier images on the fly.
 
 ### 3️⃣ Unmounting
 
@@ -121,25 +127,29 @@ To close the drive and flush all data:
 
 ### 🟦 The PNG "Feistel" Engine
 
-Previous iterations of LSB steganography required generating massive mapping tables to randomize bit placement. MirageFS solves this using **Format-Preserving Encryption** principles.
+MirageFS treats the PNG pixels as a domain of size . A custom **Feistel Network** creates a bijective (1-to-1) permutation between the *Logical Block Address* and the *Physical Pixel Index*.
 
-**MirageFS Approach:**
+* **Zero Memory Overhead:** No mapping table is stored. Locations are calculated mathematically on the fly.
+* **Invisible Header:** The "Salt" location is derived from an Argon2 hash of the password. Without the password, an attacker cannot even locate the volume header to begin a brute-force attack.
 
-1. **Dynamic Feistel Network:** The image is treated as a domain of size  (total pixels). A Feistel network with round keys derived from your password creates a bijective (1-to-1) permutation between the *Logical Block Address* and the *Physical Pixel Index*.
-2. **Cycle Walking:** To handle image sizes that are not perfect powers of 2, the algorithm iterates the Feistel function until the output lands within the valid pixel range.
-3. **Argon2 Salt Location:** The header salt is not at offset 0. Its location is derived via a separate Argon2 hash, making the filesystem undetectable without the password.
-4. **Result:**  random access performance with zero memory overhead for the map, creating perfectly uniform noise distribution.
+### 🟥 RAID 0 Striping Strategy
+
+When multiple images are provided, MirageFS creates a virtual striped volume.
+
+* **Mapping Algorithm:**
+* **Target Image:** `Logical_Block_Index % Image_Count`
+* **Target Block:** `Logical_Block_Index / Image_Count`
+
+
+* **Benefit:** This defeats forensic analysis that looks for large contiguous blobs of high-entropy data. The payload is shattered into thousands of tiny, non-contiguous fragments scattered across different files.
 
 ### 🟧 The JPEG/WebP "Morphing" Engine
 
-Compressed formats like JPEG destroy LSB data during re-encoding. MirageFS exploits the metadata layer instead.
-
-**MirageFS Approach:**
+Compressed formats like JPEG destroy LSB data. MirageFS exploits the metadata layer instead.
 
 1. **Dilution:** High-entropy encrypted data is expanded (7 bits → 8 bytes) to lower its statistical randomness.
-2. **Camouflage:** Data is wrapped in valid **TIFF headers**.
-3. **Injection:** The blob is labeled as `DNGPrivateData` (Tag `0xC634`).
-4. **Result:** Forensic tools ignore the data, identifying it as "proprietary Adobe metadata" rather than a suspicious payload.
+2. **Camouflage:** Data is wrapped in valid **TIFF headers** and labeled as `DNGPrivateData` (Tag `0xC634`).
+3. **Result:** Forensic tools ignore the data, identifying it as "proprietary Adobe metadata" rather than a suspicious payload.
 
 ---
 
@@ -187,6 +197,6 @@ Requires <a href="https://macfuse.github.io/">macFUSE</a>. The code automaticall
 
 **Author:** Seuriin ([SSL-ACTX](https://github.com/SSL-ACTX))
 
-*v1.1.0*
+*v1.2.0*
 
 </div>
