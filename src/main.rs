@@ -9,12 +9,14 @@ use env_logger::Builder;
 use std::process::Command;
 
 mod block_device;
+mod raid_device;
 mod mirage_fs;
 mod png_disk;
 mod jpeg_disk;
 mod webp_disk;
 
 use block_device::BlockDevice;
+use raid_device::Raid0Device;
 use mirage_fs::MirageFS;
 use png_disk::PngDisk;
 use jpeg_disk::JpegDisk;
@@ -23,13 +25,13 @@ use webp_disk::WebPDisk;
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
-#[command(version = "1.0.0")]
-#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image files (PNG/JPEG/WebP) using advanced steganography techniques.\n\nSupports:\n- PNG: PRNG Scatter (LSB)\n- JPEG & WebP: Adobe DNG Morphing (Segment Injection)")]
+#[command(version = "1.2.0")]
+#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image files.\n\nSupports Multi-Image RAID 0 (Striping) for heat distribution.")]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
     mount_point: PathBuf,
-    #[arg(value_name = "IMAGE_FILE")]
-    image_file: PathBuf,
+    #[arg(value_name = "IMAGE_FILES", required = true, num_args = 1..)]
+    image_files: Vec<PathBuf>,
     #[arg(short, long)]
     format: bool,
     #[arg(short, long, action = ArgAction::Count)]
@@ -42,7 +44,7 @@ fn print_banner() {
     ██ ▀▀ ██ ██ ██▄█▄ ██▀██ ██ ▄▄ ██▄▄  ██▄▄   ▀▀▀▄▄▄
     ██    ██ ██ ██ ██ ██▀██ ▀███▀ ██▄▄▄ ██     █████▀
 
-    v1.0.0 | By Seuriin (SSL-ACTX)
+    v1.2.0 | By Seuriin (SSL-ACTX)
     "#);
 }
 
@@ -83,10 +85,7 @@ fn main() -> anyhow::Result<()> {
         fs::create_dir_all(&cli.mount_point)?;
     }
 
-    if !cli.image_file.exists() {
-        anyhow::bail!("Image file '{:?}' not found.", cli.image_file);
-    }
-
+    // Password Prompt
     print!("[-] Enter Password: ");
     io::stdout().flush()?;
     let password = rpassword::read_password()?;
@@ -100,33 +99,49 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Loading container {:?}...", cli.image_file);
+    // Initialize all disks
+    let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
 
-    let extension = cli.image_file.extension()
-    .and_then(|ext| ext.to_str())
-    .map(|s| s.to_lowercase())
-    .unwrap_or_else(|| "unknown".to_string());
+    info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
 
-    let disk: Box<dyn BlockDevice> = match extension.as_str() {
-        "png" => {
-            info!("Mode: PNG (PRNG Scatter LSB)");
-            Box::new(PngDisk::new(cli.image_file.clone(), &password, cli.format)?)
-        },
-        "jpg" | "jpeg" => {
-            info!("Mode: JPEG (Adobe DNG Morphing)");
-            Box::new(JpegDisk::new(cli.image_file.clone(), &password, cli.format)?)
-        },
-        "webp" => {
-            info!("Mode: WebP (Adobe DNG Morphing)");
-            Box::new(WebPDisk::new(cli.image_file.clone(), &password, cli.format)?)
-        },
-        _ => anyhow::bail!("Unsupported file extension: .{}", extension),
-    };
+    for path in cli.image_files {
+        if !path.exists() {
+            anyhow::bail!("Image file '{:?}' not found.", path);
+        }
 
+        let extension = path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+
+        info!("Loading carrier: {:?}", path);
+
+        let disk: Box<dyn BlockDevice> = match extension.as_str() {
+            "png" => {
+                Box::new(PngDisk::new(path, &password, cli.format)?)
+            },
+            "jpg" | "jpeg" => {
+                Box::new(JpegDisk::new(path, &password, cli.format)?)
+            },
+            "webp" => {
+                Box::new(WebPDisk::new(path, &password, cli.format)?)
+            },
+            _ => anyhow::bail!("Unsupported file extension: .{}", extension),
+        };
+
+        disks.push(disk);
+    }
+
+    // Wrap in RAID Controller
+    let raid_controller = Raid0Device::new(disks)?;
+
+    // Pass the controller to the filesystem
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let fs = match MirageFS::new(disk, cli.format, uid, gid) {
+    // MirageFS sees the RAID array as a single, large block device.
+    // It doesn't know (or care) that the data is being striped.
+    let fs = match MirageFS::new(Box::new(raid_controller), cli.format, uid, gid) {
         Ok(fs) => fs,
         Err(e) => {
             error!("Filesystem Init Error: {}", e);
@@ -150,14 +165,12 @@ fn main() -> anyhow::Result<()> {
 
     ctrlc::set_handler(move || {
         info!("\n[!] Received Ctrl+C. Force unmounting...");
-
         let status = Command::new("fusermount")
         .arg("-u")
         .arg("-z")
         .arg(&mount_path)
         .status();
 
-        // Fallback
         if status.is_err() || !status.unwrap().success() {
             let _ = Command::new("umount")
             .arg(&mount_path)
