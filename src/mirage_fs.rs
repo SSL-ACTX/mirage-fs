@@ -1,0 +1,351 @@
+// src/mirage_fs.rs
+use crate::block_device::{BlockDevice, BLOCK_SIZE};
+use fuser::{
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyWrite, ReplyEmpty, Request, TimeOrNow,
+};
+use libc::{EIO, ENOENT};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use flate2::write::ZlibEncoder;
+use flate2::read::ZlibDecoder;
+use flate2::Compression;
+
+const TTL: Duration = Duration::from_secs(1);
+const METADATA_BLOCKS: u32 = 2;
+const SUPERBLOCK_ID: u32 = 0;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SerializedFileAttr {
+    ino: u64, size: u64, blocks: u64, kind_is_dir: bool,
+    perm: u16, nlink: u32, uid: u32, gid: u32, mtime_secs: u64,
+}
+
+impl From<&FileAttr> for SerializedFileAttr {
+    fn from(attr: &FileAttr) -> Self {
+        Self {
+            ino: attr.ino, size: attr.size, blocks: attr.blocks,
+            kind_is_dir: attr.kind == FileType::Directory,
+            perm: attr.perm, nlink: attr.nlink, uid: attr.uid, gid: attr.gid,
+            mtime_secs: attr.mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        }
+    }
+}
+
+impl Into<FileAttr> for SerializedFileAttr {
+    fn into(self) -> FileAttr {
+        FileAttr {
+            ino: self.ino, size: self.size, blocks: self.blocks,
+            atime: UNIX_EPOCH + Duration::from_secs(self.mtime_secs),
+            mtime: UNIX_EPOCH + Duration::from_secs(self.mtime_secs),
+            ctime: UNIX_EPOCH + Duration::from_secs(self.mtime_secs),
+            crtime: UNIX_EPOCH + Duration::from_secs(self.mtime_secs),
+            kind: if self.kind_is_dir { FileType::Directory } else { FileType::RegularFile },
+            perm: self.perm, nlink: self.nlink, uid: self.uid, gid: self.gid,
+            rdev: 0, flags: 0, blksize: 512,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Inode { attr: SerializedFileAttr, start_block: u32 }
+
+#[derive(Serialize, Deserialize)]
+struct Superblock {
+    inodes: HashMap<u64, Inode>,
+    directory_map: HashMap<u64, HashMap<String, u64>>,
+    next_inode: u64,
+    next_free_block: u32,
+}
+
+pub struct MirageFS {
+    disk: Box<dyn BlockDevice>,
+    inodes: HashMap<u64, Inode>,
+    directory_map: HashMap<u64, HashMap<String, u64>>,
+    next_inode: u64,
+    next_free_block: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl MirageFS {
+    pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32) -> anyhow::Result<Self> {
+        // 1. Try to load metadata first (without moving disk)
+        let load_result = Self::load_metadata(&disk);
+
+        if let Ok(sb) = load_result {
+            println!("Superblock Loaded! {} inodes found.", sb.inodes.len());
+
+            if !format {
+                // PATH A: Success load, not formatting.
+                // Move disk NOW.
+                let mut fs = MirageFS {
+                    disk,
+                    inodes: sb.inodes, directory_map: sb.directory_map,
+                    next_inode: sb.next_inode, next_free_block: sb.next_free_block,
+                    uid, gid
+                };
+
+                // Force-update ownership
+                for inode in fs.inodes.values_mut() {
+                    inode.attr.uid = uid;
+                    inode.attr.gid = gid;
+                }
+                return Ok(fs);
+            } else {
+                println!("WARNING: Formatting over an existing MirageFS volume.");
+            }
+        } else if let Err(e) = load_result {
+            if !format { return Err(anyhow::anyhow!("Mount Failed: {}", e)); }
+            println!("Formatting new volume...");
+        }
+
+        // PATH B: Formatting (or failed load + format=true)
+        // Disk has NOT been moved yet, so we move it here.
+        let mut fs = MirageFS {
+            disk,
+            inodes: HashMap::new(), directory_map: HashMap::new(),
+            next_inode: 2, next_free_block: METADATA_BLOCKS,
+            uid, gid
+        };
+
+        let root_attr = FileAttr {
+            ino: 1, size: 0, blocks: 0,
+            atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(),
+            kind: FileType::Directory, perm: 0o755, nlink: 2,
+            uid, gid,
+            rdev: 0, flags: 0, blksize: 512,
+        };
+        fs.inodes.insert(1, Inode { attr: (&root_attr).into(), start_block: 0 });
+        fs.directory_map.insert(1, HashMap::new());
+
+        fs.save_metadata()?;
+        fs.disk.sync()?;
+        Ok(fs)
+    }
+
+    fn load_metadata(disk: &Box<dyn BlockDevice>) -> anyhow::Result<Superblock> {
+        let mut raw_data = Vec::new();
+        for i in 0..METADATA_BLOCKS {
+            let block = disk.read_block(SUPERBLOCK_ID + i).map_err(|e| anyhow::anyhow!(e))?;
+            raw_data.extend_from_slice(&block);
+        }
+
+        if raw_data.iter().all(|&x| x == 0) { return Err(anyhow::anyhow!("Empty")); }
+
+        let mut decoder = ZlibDecoder::new(&raw_data[..]);
+        let mut decompressed_data = Vec::new();
+        if std::io::Read::read_to_end(&mut decoder, &mut decompressed_data).is_err() {
+            return Err(anyhow::anyhow!("Decompression failed"));
+        }
+
+        let sb: Superblock = bincode::deserialize(&decompressed_data)?;
+        Ok(sb)
+    }
+
+    fn save_metadata(&mut self) -> anyhow::Result<()> {
+        let sb = Superblock {
+            inodes: self.inodes.clone(), directory_map: self.directory_map.clone(),
+            next_inode: self.next_inode, next_free_block: self.next_free_block,
+        };
+
+        let data = bincode::serialize(&sb)?;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&data)?;
+        let compressed_data = encoder.finish()?;
+
+        let chunks = compressed_data.chunks(BLOCK_SIZE);
+        if chunks.len() > METADATA_BLOCKS as usize {
+            eprintln!("CRITICAL: Metadata overflow!");
+        }
+
+        let mut blocks_written = 0;
+        for (i, chunk) in chunks.enumerate() {
+            let mut block = [0u8; BLOCK_SIZE];
+            block[0..chunk.len()].copy_from_slice(chunk);
+            self.disk.write_block(SUPERBLOCK_ID + i as u32, &block).map_err(|e| anyhow::anyhow!(e))?;
+            blocks_written += 1;
+        }
+
+        let zero_block = [0u8; BLOCK_SIZE];
+        for i in blocks_written..METADATA_BLOCKS as usize {
+            self.disk.write_block(SUPERBLOCK_ID + i as u32, &zero_block).map_err(|e| anyhow::anyhow!(e))?;
+        }
+
+        Ok(())
+    }
+
+    fn allocate_inode(&mut self, kind: FileType, perm: u16) -> u64 {
+        let ino = self.next_inode;
+        self.next_inode += 1;
+        let start_block = if kind == FileType::RegularFile {
+            let b = self.next_free_block;
+            self.next_free_block += 1;
+            b
+        } else { 0 };
+
+        let attr = FileAttr {
+            ino, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(),
+            ctime: SystemTime::now(), crtime: SystemTime::now(), kind, perm, nlink: 1,
+            uid: self.uid, gid: self.gid,
+            rdev: 0, flags: 0, blksize: 512,
+        };
+        self.inodes.insert(ino, Inode { attr: (&attr).into(), start_block });
+        ino
+    }
+
+    fn sync_disk(&mut self) -> i32 {
+        if let Err(_) = self.save_metadata() { return EIO; }
+        if let Err(_) = self.disk.sync() { return EIO; }
+        0
+    }
+}
+
+impl Filesystem for MirageFS {
+    fn destroy(&mut self) {
+        let _ = self.sync_disk();
+    }
+
+    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+    }
+
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+    }
+
+    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _u: u32, _f: i32, reply: ReplyCreate) {
+        let name_str = name.to_str().unwrap().to_string();
+        let new_ino = self.allocate_inode(FileType::RegularFile, mode as u16);
+        self.directory_map.entry(parent).or_default().insert(name_str, new_ino);
+
+        let _ = self.sync_disk();
+
+        if let Some(inode) = self.inodes.get(&new_ino) {
+            reply.created(&TTL, &inode.attr.clone().into(), 0, 0, 0);
+        } else { reply.error(EIO); }
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name_str = name.to_str().unwrap().to_string();
+
+        let ino_to_remove = if let Some(children) = self.directory_map.get_mut(&parent) {
+            children.remove(&name_str)
+        } else {
+            None
+        };
+
+        if let Some(ino) = ino_to_remove {
+            self.inodes.remove(&ino);
+            if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn setattr(&mut self, _req: &Request, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _a: Option<TimeOrNow>, _m: Option<TimeOrNow>, _c: Option<SystemTime>, _fh: Option<u64>, _cr: Option<SystemTime>, _ch: Option<SystemTime>, _bk: Option<SystemTime>, _fl: Option<u32>, reply: ReplyAttr) {
+        let attr_to_reply = if let Some(inode) = self.inodes.get_mut(&ino) {
+            if let Some(m) = mode { inode.attr.perm = m as u16; }
+            if let Some(u) = uid { inode.attr.uid = u; }
+            if let Some(g) = gid { inode.attr.gid = g; }
+            if let Some(s) = size { inode.attr.size = s; }
+            Some(inode.attr.clone())
+        } else {
+            None
+        };
+
+        if let Some(attr) = attr_to_reply {
+            let _ = self.sync_disk();
+            reply.attr(&TTL, &attr.into());
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _w: u32, _f: i32, _l: Option<u64>, reply: ReplyWrite) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            let start_block_idx = inode.start_block;
+            let relative_block = (offset as usize) / BLOCK_SIZE;
+            let block_offset = (offset as usize) % BLOCK_SIZE;
+            let abs_block_idx = start_block_idx + relative_block as u32;
+
+            let max_initialized_blocks = if inode.attr.size == 0 { 0 } else { (inode.attr.size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE };
+
+            let mut block_data = if relative_block >= max_initialized_blocks {
+                [0u8; BLOCK_SIZE]
+            } else {
+                match self.disk.read_block(abs_block_idx) {
+                    Ok(data) => data,
+                    Err(_) => { reply.error(EIO); return; }
+                }
+            };
+
+            let write_len = std::cmp::min(data.len(), BLOCK_SIZE - block_offset);
+            block_data[block_offset..block_offset + write_len].copy_from_slice(&data[0..write_len]);
+
+            if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) { reply.error(EIO); return; }
+
+            let end_pos = (offset as u64) + (write_len as u64);
+            if end_pos > inode.attr.size { inode.attr.size = end_pos; }
+
+            reply.written(write_len as u32);
+        } else { reply.error(ENOENT); }
+    }
+
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let name_str = name.to_str().unwrap().to_string();
+        if let Some(children) = self.directory_map.get(&parent) {
+            if let Some(&ino) = children.get(&name_str) {
+                if let Some(inode) = self.inodes.get(&ino) {
+                    reply.entry(&TTL, &inode.attr.clone().into(), 0);
+                    return;
+                }
+            }
+        }
+        reply.error(ENOENT);
+    }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        match self.inodes.get(&ino) {
+            Some(inode) => reply.attr(&TTL, &inode.attr.clone().into()),
+            None => reply.error(ENOENT),
+        }
+    }
+
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _fl: i32, _l: Option<u64>, reply: ReplyData) {
+        if let Some(inode) = self.inodes.get(&ino) {
+            let start_block_idx = inode.start_block;
+            let relative_block = (offset as usize) / BLOCK_SIZE;
+            let block_offset = (offset as usize) % BLOCK_SIZE;
+            let abs_block_idx = start_block_idx + relative_block as u32;
+            match self.disk.read_block(abs_block_idx) {
+                Ok(block_data) => {
+                    let available = BLOCK_SIZE - block_offset;
+                    let read_len = std::cmp::min(size as usize, available);
+                    reply.data(&block_data[block_offset..block_offset + read_len]);
+                }
+                Err(_) => reply.error(EIO),
+            }
+        } else { reply.error(ENOENT); }
+    }
+
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        if offset > 0 { reply.ok(); return; }
+        let _ = reply.add(ino, 1, FileType::Directory, ".");
+        let _ = reply.add(ino, 2, FileType::Directory, "..");
+        if let Some(children) = self.directory_map.get(&ino) {
+            let mut i = 3;
+            for (name, child_ino) in children {
+                if let Some(child_inode) = self.inodes.get(child_ino) {
+                    let kind = if child_inode.attr.kind_is_dir { FileType::Directory } else { FileType::RegularFile };
+                    let _ = reply.add(*child_ino, i, kind, name);
+                    i += 1;
+                }
+            }
+        }
+        reply.ok();
+    }
+}
