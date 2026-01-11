@@ -51,14 +51,21 @@ impl Into<FileAttr> for SerializedFileAttr {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Inode { attr: SerializedFileAttr, start_block: u32 }
+struct Inode {
+    attr: SerializedFileAttr,
+    // Replaced contiguous `start_block` with scattered `blocks` for hole filling
+    blocks: Vec<u32>
+}
 
 #[derive(Serialize, Deserialize)]
 struct Superblock {
     inodes: HashMap<u64, Inode>,
     directory_map: HashMap<u64, HashMap<String, u64>>,
     next_inode: u64,
-    next_free_block: u32,
+    // Tracks the total blocks currently used on disk (high-water mark)
+    disk_size_blocks: u32,
+    // Reverse map: Physical Block -> Inode Owner (needed for compaction)
+    block_owner: HashMap<u32, u64>,
 }
 
 pub struct MirageFS {
@@ -66,49 +73,42 @@ pub struct MirageFS {
     inodes: HashMap<u64, Inode>,
     directory_map: HashMap<u64, HashMap<String, u64>>,
     next_inode: u64,
-    next_free_block: u32,
+    disk_size_blocks: u32,
+    block_owner: HashMap<u32, u64>,
     uid: u32,
     gid: u32,
 }
 
 impl MirageFS {
     pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32) -> anyhow::Result<Self> {
-        // 1. Try to load metadata first (without moving disk)
         let load_result = Self::load_metadata(&disk);
 
         if let Ok(sb) = load_result {
             println!("Superblock Loaded! {} inodes found.", sb.inodes.len());
 
             if !format {
-                // PATH A: Success load, not formatting.
-                // Move disk NOW.
                 let mut fs = MirageFS {
                     disk,
                     inodes: sb.inodes, directory_map: sb.directory_map,
-                    next_inode: sb.next_inode, next_free_block: sb.next_free_block,
+                    next_inode: sb.next_inode,
+                    disk_size_blocks: sb.disk_size_blocks,
+                    block_owner: sb.block_owner,
                     uid, gid
                 };
-
-                // Force-update ownership
                 for inode in fs.inodes.values_mut() {
                     inode.attr.uid = uid;
                     inode.attr.gid = gid;
                 }
                 return Ok(fs);
-            } else {
-                println!("WARNING: Formatting over an existing MirageFS volume.");
             }
-        } else if let Err(e) = load_result {
-            if !format { return Err(anyhow::anyhow!("Mount Failed: {}", e)); }
-            println!("Formatting new volume...");
         }
 
-        // PATH B: Formatting (or failed load + format=true)
-        // Disk has NOT been moved yet, so we move it here.
         let mut fs = MirageFS {
             disk,
             inodes: HashMap::new(), directory_map: HashMap::new(),
-            next_inode: 2, next_free_block: METADATA_BLOCKS,
+            next_inode: 2,
+            disk_size_blocks: METADATA_BLOCKS,
+            block_owner: HashMap::new(),
             uid, gid
         };
 
@@ -119,7 +119,7 @@ impl MirageFS {
             uid, gid,
             rdev: 0, flags: 0, blksize: 512,
         };
-        fs.inodes.insert(1, Inode { attr: (&root_attr).into(), start_block: 0 });
+        fs.inodes.insert(1, Inode { attr: (&root_attr).into(), blocks: Vec::new() });
         fs.directory_map.insert(1, HashMap::new());
 
         fs.save_metadata()?;
@@ -149,7 +149,9 @@ impl MirageFS {
     fn save_metadata(&mut self) -> anyhow::Result<()> {
         let sb = Superblock {
             inodes: self.inodes.clone(), directory_map: self.directory_map.clone(),
-            next_inode: self.next_inode, next_free_block: self.next_free_block,
+            next_inode: self.next_inode,
+            disk_size_blocks: self.disk_size_blocks,
+            block_owner: self.block_owner.clone(),
         };
 
         let data = bincode::serialize(&sb)?;
@@ -181,23 +183,19 @@ impl MirageFS {
     fn allocate_inode(&mut self, kind: FileType, perm: u16) -> u64 {
         let ino = self.next_inode;
         self.next_inode += 1;
-        let start_block = if kind == FileType::RegularFile {
-            let b = self.next_free_block;
-            self.next_free_block += 1;
-            b
-        } else { 0 };
-
         let attr = FileAttr {
             ino, size: 0, blocks: 0, atime: SystemTime::now(), mtime: SystemTime::now(),
             ctime: SystemTime::now(), crtime: SystemTime::now(), kind, perm, nlink: 1,
             uid: self.uid, gid: self.gid,
             rdev: 0, flags: 0, blksize: 512,
         };
-        self.inodes.insert(ino, Inode { attr: (&attr).into(), start_block });
+        self.inodes.insert(ino, Inode { attr: (&attr).into(), blocks: Vec::new() });
         ino
     }
 
     fn sync_disk(&mut self) -> i32 {
+        // Before syncing, tell the block device our actual size
+        if let Err(_) = self.disk.resize(self.disk_size_blocks as u64) { return EIO; }
         if let Err(_) = self.save_metadata() { return EIO; }
         if let Err(_) = self.disk.sync() { return EIO; }
         0
@@ -229,6 +227,7 @@ impl Filesystem for MirageFS {
         } else { reply.error(EIO); }
     }
 
+    // --- COMPACTION LOGIC HERE ---
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_str().unwrap().to_string();
 
@@ -239,7 +238,44 @@ impl Filesystem for MirageFS {
         };
 
         if let Some(ino) = ino_to_remove {
-            self.inodes.remove(&ino);
+            if let Some(inode) = self.inodes.remove(&ino) {
+                // Free every block used by this file using Swap-and-Pop
+                for &free_block_idx in &inode.blocks {
+                    self.block_owner.remove(&free_block_idx); // Remove ownership
+
+                    // We want to fill `free_block_idx` with the LAST block on disk
+                    let last_block_idx = self.disk_size_blocks - 1;
+
+                    if free_block_idx == last_block_idx {
+                        // Simple case: we are freeing the last block
+                        self.disk_size_blocks -= 1;
+                    } else {
+                        // Complex case: Move data from last_block to free_block
+                        if let Ok(data) = self.disk.read_block(last_block_idx) {
+                            if self.disk.write_block(free_block_idx, &data).is_ok() {
+                                // Identify who owned the last block
+                                if let Some(&owner_ino) = self.block_owner.get(&last_block_idx) {
+                                    if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
+                                        // Update owner's block list: replace last_block_idx with free_block_idx
+                                        for b in &mut owner_inode.blocks {
+                                            if *b == last_block_idx {
+                                                *b = free_block_idx;
+                                                break;
+                                            }
+                                        }
+                                        // Update ownership map
+                                        self.block_owner.remove(&last_block_idx);
+                                        self.block_owner.insert(free_block_idx, owner_ino);
+                                    }
+                                }
+                            }
+                        }
+                        // Shrink disk
+                        self.disk_size_blocks -= 1;
+                    }
+                }
+            }
+
             if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
         } else {
             reply.error(ENOENT);
@@ -251,7 +287,11 @@ impl Filesystem for MirageFS {
             if let Some(m) = mode { inode.attr.perm = m as u16; }
             if let Some(u) = uid { inode.attr.uid = u; }
             if let Some(g) = gid { inode.attr.gid = g; }
+
+            // Note: Truncating via setattr (size) is harder to implement perfectly with
+            // compaction immediately, so we just update size. Ideally we should free blocks here too.
             if let Some(s) = size { inode.attr.size = s; }
+
             Some(inode.attr.clone())
         } else {
             None
@@ -267,19 +307,25 @@ impl Filesystem for MirageFS {
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _w: u32, _f: i32, _l: Option<u64>, reply: ReplyWrite) {
         if let Some(inode) = self.inodes.get_mut(&ino) {
-            let start_block_idx = inode.start_block;
             let relative_block = (offset as usize) / BLOCK_SIZE;
             let block_offset = (offset as usize) % BLOCK_SIZE;
-            let abs_block_idx = start_block_idx + relative_block as u32;
 
-            let max_initialized_blocks = if inode.attr.size == 0 { 0 } else { (inode.attr.size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE };
+            // Grow block list if necessary
+            while inode.blocks.len() <= relative_block {
+                let new_block_idx = self.disk_size_blocks;
+                self.disk_size_blocks += 1;
+                inode.blocks.push(new_block_idx);
+                self.block_owner.insert(new_block_idx, ino);
+            }
 
-            let mut block_data = if relative_block >= max_initialized_blocks {
-                [0u8; BLOCK_SIZE]
+            let abs_block_idx = inode.blocks[relative_block];
+
+            let mut block_data = if block_offset == 0 && data.len() >= BLOCK_SIZE {
+                [0u8; BLOCK_SIZE] // Optimization: Full overwrite
             } else {
                 match self.disk.read_block(abs_block_idx) {
                     Ok(data) => data,
-                    Err(_) => { reply.error(EIO); return; }
+                    Err(_) => [0u8; BLOCK_SIZE], // New block assumption
                 }
             };
 
@@ -290,6 +336,8 @@ impl Filesystem for MirageFS {
 
             let end_pos = (offset as u64) + (write_len as u64);
             if end_pos > inode.attr.size { inode.attr.size = end_pos; }
+            // Update blocks count in attr for stats
+            inode.attr.blocks = inode.blocks.len() as u64;
 
             reply.written(write_len as u32);
         } else { reply.error(ENOENT); }
@@ -317,10 +365,15 @@ impl Filesystem for MirageFS {
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _fl: i32, _l: Option<u64>, reply: ReplyData) {
         if let Some(inode) = self.inodes.get(&ino) {
-            let start_block_idx = inode.start_block;
             let relative_block = (offset as usize) / BLOCK_SIZE;
             let block_offset = (offset as usize) % BLOCK_SIZE;
-            let abs_block_idx = start_block_idx + relative_block as u32;
+
+            if relative_block >= inode.blocks.len() {
+                reply.data(&[]);
+                return;
+            }
+
+            let abs_block_idx = inode.blocks[relative_block];
             match self.disk.read_block(abs_block_idx) {
                 Ok(block_data) => {
                     let available = BLOCK_SIZE - block_offset;

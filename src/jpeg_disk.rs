@@ -20,8 +20,6 @@ use argon2::{
 const MIRAGE_MARKER: u8 = 0xE1;
 
 // Adobe DNG Morphing Constants
-// We construct a valid TIFF header inside the APP1 segment to mimic
-// legitimate "DNG Private Data" (Tag 0xC634).
 const EXIF_HEADER: &[u8; 6] = b"Exif\0\0";
 const TIFF_HEADER: &[u8; 8] = b"\x49\x49\x2A\x00\x08\x00\x00\x00"; // Little Endian TIFF
 const DNG_TAG: [u8; 2] = [0x34, 0xC6];
@@ -126,7 +124,6 @@ impl JpegDisk {
 
     fn dilute_entropy(input: &[u8]) -> Vec<u8> {
         // Expands 7 bits -> 8 bytes to lower entropy density (Stealth)
-        // This makes the encrypted data look like standard binary metadata.
         let mut output = Vec::with_capacity((input.len() * 8 + 6) / 7);
         let mut bit_buffer: u64 = 0;
         let mut bit_count = 0;
@@ -240,6 +237,12 @@ impl BlockDevice for JpegDisk {
         }
 
         self.raw_storage[start_offset..end_offset].copy_from_slice(&packet);
+        Ok(())
+    }
+
+    fn resize(&mut self, block_count: u64) -> Result<()> {
+        let new_len = SALT_SIZE + (block_count as usize * ENCRYPTED_BLOCK_SIZE);
+        self.raw_storage.resize(new_len, 0);
         Ok(())
     }
 

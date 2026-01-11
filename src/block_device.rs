@@ -9,5 +9,6 @@ pub trait BlockDevice {
     fn block_count(&self) -> u64;
     fn read_block(&self, index: u32) -> Result<[u8; BLOCK_SIZE]>;
     fn write_block(&mut self, index: u32, data: &[u8; BLOCK_SIZE]) -> Result<()>;
+    fn resize(&mut self, block_count: u64) -> Result<()>;
     fn sync(&mut self) -> Result<()>;
 }

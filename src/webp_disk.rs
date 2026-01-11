@@ -222,6 +222,12 @@ impl BlockDevice for WebPDisk {
         Ok(())
     }
 
+    fn resize(&mut self, block_count: u64) -> Result<()> {
+        let new_len = SALT_SIZE + (block_count as usize * ENCRYPTED_BLOCK_SIZE);
+        self.raw_storage.resize(new_len, 0);
+        Ok(())
+    }
+
     fn sync(&mut self) -> Result<()> {
         // Access chunks via the stored WebP structure
         let chunks = self.webp_structure.chunks_mut();
