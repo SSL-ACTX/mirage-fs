@@ -53,7 +53,7 @@ impl Into<FileAttr> for SerializedFileAttr {
 #[derive(Serialize, Deserialize, Clone)]
 struct Inode {
     attr: SerializedFileAttr,
-    // Replaced contiguous `start_block` with scattered `blocks` for hole filling
+    // Scatter-gather list of physical block indices
     blocks: Vec<u32>
 }
 
@@ -62,9 +62,9 @@ struct Superblock {
     inodes: HashMap<u64, Inode>,
     directory_map: HashMap<u64, HashMap<String, u64>>,
     next_inode: u64,
-    // Tracks the total blocks currently used on disk (high-water mark)
+    // High-water mark for disk usage
     disk_size_blocks: u32,
-    // Reverse map: Physical Block -> Inode Owner (needed for compaction)
+    // Reverse map for compaction: Physical Block -> Owner Inode
     block_owner: HashMap<u32, u64>,
 }
 
@@ -95,6 +95,7 @@ impl MirageFS {
                     block_owner: sb.block_owner,
                     uid, gid
                 };
+                // Fix permissions for current user context
                 for inode in fs.inodes.values_mut() {
                     inode.attr.uid = uid;
                     inode.attr.gid = gid;
@@ -103,6 +104,7 @@ impl MirageFS {
             }
         }
 
+        // Initialize empty filesystem
         let mut fs = MirageFS {
             disk,
             inodes: HashMap::new(), directory_map: HashMap::new(),
@@ -112,6 +114,7 @@ impl MirageFS {
             uid, gid
         };
 
+        // Create Root Directory
         let root_attr = FileAttr {
             ino: 1, size: 0, blocks: 0,
             atime: SystemTime::now(), mtime: SystemTime::now(), ctime: SystemTime::now(), crtime: SystemTime::now(),
@@ -172,6 +175,7 @@ impl MirageFS {
             blocks_written += 1;
         }
 
+        // Zero out remaining metadata blocks
         let zero_block = [0u8; BLOCK_SIZE];
         for i in blocks_written..METADATA_BLOCKS as usize {
             self.disk.write_block(SUPERBLOCK_ID + i as u32, &zero_block).map_err(|e| anyhow::anyhow!(e))?;
@@ -194,7 +198,6 @@ impl MirageFS {
     }
 
     fn sync_disk(&mut self) -> i32 {
-        // Before syncing, tell the block device our actual size
         if let Err(_) = self.disk.resize(self.disk_size_blocks as u64) { return EIO; }
         if let Err(_) = self.save_metadata() { return EIO; }
         if let Err(_) = self.disk.sync() { return EIO; }
@@ -227,7 +230,6 @@ impl Filesystem for MirageFS {
         } else { reply.error(EIO); }
     }
 
-    // --- COMPACTION LOGIC HERE ---
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_str().unwrap().to_string();
 
@@ -239,38 +241,33 @@ impl Filesystem for MirageFS {
 
         if let Some(ino) = ino_to_remove {
             if let Some(inode) = self.inodes.remove(&ino) {
-                // Free every block used by this file using Swap-and-Pop
+                // COMPACTION: Swap-and-Pop to free blocks
                 for &free_block_idx in &inode.blocks {
-                    self.block_owner.remove(&free_block_idx); // Remove ownership
+                    self.block_owner.remove(&free_block_idx);
 
-                    // We want to fill `free_block_idx` with the LAST block on disk
                     let last_block_idx = self.disk_size_blocks - 1;
 
                     if free_block_idx == last_block_idx {
-                        // Simple case: we are freeing the last block
                         self.disk_size_blocks -= 1;
                     } else {
-                        // Complex case: Move data from last_block to free_block
+                        // Move data from end of disk to the hole we just created
                         if let Ok(data) = self.disk.read_block(last_block_idx) {
                             if self.disk.write_block(free_block_idx, &data).is_ok() {
-                                // Identify who owned the last block
+                                // Update the owner of the moved block
                                 if let Some(&owner_ino) = self.block_owner.get(&last_block_idx) {
                                     if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
-                                        // Update owner's block list: replace last_block_idx with free_block_idx
                                         for b in &mut owner_inode.blocks {
                                             if *b == last_block_idx {
                                                 *b = free_block_idx;
                                                 break;
                                             }
                                         }
-                                        // Update ownership map
                                         self.block_owner.remove(&last_block_idx);
                                         self.block_owner.insert(free_block_idx, owner_ino);
                                     }
                                 }
                             }
                         }
-                        // Shrink disk
                         self.disk_size_blocks -= 1;
                     }
                 }
@@ -287,9 +284,6 @@ impl Filesystem for MirageFS {
             if let Some(m) = mode { inode.attr.perm = m as u16; }
             if let Some(u) = uid { inode.attr.uid = u; }
             if let Some(g) = gid { inode.attr.gid = g; }
-
-            // Note: Truncating via setattr (size) is harder to implement perfectly with
-            // compaction immediately, so we just update size. Ideally we should free blocks here too.
             if let Some(s) = size { inode.attr.size = s; }
 
             Some(inode.attr.clone())
@@ -307,39 +301,59 @@ impl Filesystem for MirageFS {
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _w: u32, _f: i32, _l: Option<u64>, reply: ReplyWrite) {
         if let Some(inode) = self.inodes.get_mut(&ino) {
-            let relative_block = (offset as usize) / BLOCK_SIZE;
-            let block_offset = (offset as usize) % BLOCK_SIZE;
+            let mut total_written: usize = 0;
+            let mut current_offset = offset as usize;
 
-            // Grow block list if necessary
-            while inode.blocks.len() <= relative_block {
-                let new_block_idx = self.disk_size_blocks;
-                self.disk_size_blocks += 1;
-                inode.blocks.push(new_block_idx);
-                self.block_owner.insert(new_block_idx, ino);
+            // Loop required to handle writes spanning multiple blocks (RAID/Striping fix)
+            while total_written < data.len() {
+                let relative_block = current_offset / BLOCK_SIZE;
+                let block_offset = current_offset % BLOCK_SIZE;
+
+                // Dynamically allocate new blocks if writing beyond current EOF
+                while inode.blocks.len() <= relative_block {
+                    let new_block_idx = self.disk_size_blocks;
+                    self.disk_size_blocks += 1;
+                    inode.blocks.push(new_block_idx);
+                    self.block_owner.insert(new_block_idx, ino);
+                }
+
+                let abs_block_idx = inode.blocks[relative_block];
+
+                // Determine how much data fits in the current block
+                let remaining_data = data.len() - total_written;
+                let space_in_block = BLOCK_SIZE - block_offset;
+                let chunk_size = std::cmp::min(remaining_data, space_in_block);
+
+                // Read-Modify-Write cycle
+                let mut block_data = if block_offset == 0 && chunk_size == BLOCK_SIZE {
+                    [0u8; BLOCK_SIZE] // Optimization: Full block overwrite
+                } else {
+                    match self.disk.read_block(abs_block_idx) {
+                        Ok(data) => data,
+                        Err(_) => [0u8; BLOCK_SIZE],
+                    }
+                };
+
+                // Copy chunk into buffer
+                let chunk_data = &data[total_written..total_written + chunk_size];
+                block_data[block_offset..block_offset + chunk_size].copy_from_slice(chunk_data);
+
+                // Commit block
+                if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) {
+                    if total_written > 0 { break; } // Return partial success if possible
+                    reply.error(EIO);
+                    return;
+                }
+
+                total_written += chunk_size;
+                current_offset += chunk_size;
             }
 
-            let abs_block_idx = inode.blocks[relative_block];
-
-            let mut block_data = if block_offset == 0 && data.len() >= BLOCK_SIZE {
-                [0u8; BLOCK_SIZE] // Optimization: Full overwrite
-            } else {
-                match self.disk.read_block(abs_block_idx) {
-                    Ok(data) => data,
-                    Err(_) => [0u8; BLOCK_SIZE], // New block assumption
-                }
-            };
-
-            let write_len = std::cmp::min(data.len(), BLOCK_SIZE - block_offset);
-            block_data[block_offset..block_offset + write_len].copy_from_slice(&data[0..write_len]);
-
-            if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) { reply.error(EIO); return; }
-
-            let end_pos = (offset as u64) + (write_len as u64);
+            let end_pos = (offset as u64) + (total_written as u64);
             if end_pos > inode.attr.size { inode.attr.size = end_pos; }
-            // Update blocks count in attr for stats
             inode.attr.blocks = inode.blocks.len() as u64;
 
-            reply.written(write_len as u32);
+            reply.written(total_written as u32);
         } else { reply.error(ENOENT); }
     }
 
@@ -365,23 +379,42 @@ impl Filesystem for MirageFS {
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _fl: i32, _l: Option<u64>, reply: ReplyData) {
         if let Some(inode) = self.inodes.get(&ino) {
-            let relative_block = (offset as usize) / BLOCK_SIZE;
-            let block_offset = (offset as usize) % BLOCK_SIZE;
+            let mut collected_data = Vec::with_capacity(size as usize);
+            let mut current_offset = offset as usize;
+            let mut remaining_size = size as usize;
 
-            if relative_block >= inode.blocks.len() {
-                reply.data(&[]);
-                return;
-            }
+            // Loop to aggregate data from multiple scattered blocks
+            while remaining_size > 0 {
+                let relative_block = current_offset / BLOCK_SIZE;
+                let block_offset = current_offset % BLOCK_SIZE;
 
-            let abs_block_idx = inode.blocks[relative_block];
-            match self.disk.read_block(abs_block_idx) {
-                Ok(block_data) => {
-                    let available = BLOCK_SIZE - block_offset;
-                    let read_len = std::cmp::min(size as usize, available);
-                    reply.data(&block_data[block_offset..block_offset + read_len]);
+                if relative_block >= inode.blocks.len() {
+                    break; // EOF reached
                 }
-                Err(_) => reply.error(EIO),
+
+                let abs_block_idx = inode.blocks[relative_block];
+
+                match self.disk.read_block(abs_block_idx) {
+                    Ok(block_data) => {
+                        let available_in_block = BLOCK_SIZE - block_offset;
+                        let read_len = std::cmp::min(remaining_size, available_in_block);
+
+                        collected_data.extend_from_slice(&block_data[block_offset..block_offset + read_len]);
+
+                        current_offset += read_len;
+                        remaining_size -= read_len;
+                    }
+                    Err(_) => {
+                        if collected_data.is_empty() {
+                            reply.error(EIO);
+                            return;
+                        }
+                        break;
+                    }
+                }
             }
+
+            reply.data(&collected_data);
         } else { reply.error(ENOENT); }
     }
 
