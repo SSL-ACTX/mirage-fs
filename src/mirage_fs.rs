@@ -4,7 +4,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyWrite, ReplyEmpty, Request, TimeOrNow,
 };
-use libc::{EIO, ENOENT};
+use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -197,6 +197,47 @@ impl MirageFS {
         ino
     }
 
+    /// Helper: Free blocks associated with an inode and perform swap-and-pop compaction
+    fn free_inode_blocks(&mut self, ino: u64) {
+        // Clone blocks to avoid borrowing self.inodes while mutating it during compaction
+        let blocks_to_free = if let Some(inode) = self.inodes.get(&ino) {
+            inode.blocks.clone()
+        } else {
+            return;
+        };
+
+        // COMPACTION: Swap-and-Pop to free blocks
+        for free_block_idx in blocks_to_free {
+            self.block_owner.remove(&free_block_idx);
+
+            let last_block_idx = self.disk_size_blocks - 1;
+
+            if free_block_idx == last_block_idx {
+                self.disk_size_blocks -= 1;
+            } else {
+                // Move data from end of disk to the hole we just created
+                if let Ok(data) = self.disk.read_block(last_block_idx) {
+                    if self.disk.write_block(free_block_idx, &data).is_ok() {
+                        // Update the owner of the moved block
+                        if let Some(&owner_ino) = self.block_owner.get(&last_block_idx) {
+                            if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
+                                for b in &mut owner_inode.blocks {
+                                    if *b == last_block_idx {
+                                        *b = free_block_idx;
+                                        break;
+                                    }
+                                }
+                                self.block_owner.remove(&last_block_idx);
+                                self.block_owner.insert(free_block_idx, owner_ino);
+                            }
+                        }
+                    }
+                }
+                self.disk_size_blocks -= 1;
+            }
+        }
+    }
+
     fn sync_disk(&mut self) -> i32 {
         if let Err(_) = self.disk.resize(self.disk_size_blocks as u64) { return EIO; }
         if let Err(_) = self.save_metadata() { return EIO; }
@@ -230,6 +271,61 @@ impl Filesystem for MirageFS {
         } else { reply.error(EIO); }
     }
 
+    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _u: u32, reply: ReplyEntry) {
+        let name_str = name.to_str().unwrap().to_string();
+
+        if let Some(children) = self.directory_map.get(&parent) {
+            if children.contains_key(&name_str) {
+                reply.error(EEXIST);
+                return;
+            }
+        }
+
+        let new_ino = self.allocate_inode(FileType::Directory, mode as u16);
+        self.directory_map.entry(parent).or_default().insert(name_str, new_ino);
+
+        // Initialize empty directory children map for the new folder
+        self.directory_map.insert(new_ino, HashMap::new());
+
+        let _ = self.sync_disk();
+
+        if let Some(inode) = self.inodes.get(&new_ino) {
+            reply.entry(&TTL, &inode.attr.clone().into(), 0);
+        } else {
+            reply.error(EIO);
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name_str = name.to_str().unwrap().to_string();
+
+        let ino_opt = self.directory_map.get(&parent)
+        .and_then(|children| children.get(&name_str).cloned());
+
+        if let Some(ino) = ino_opt {
+            // Check if empty
+            if let Some(children) = self.directory_map.get(&ino) {
+                if !children.is_empty() {
+                    reply.error(ENOTEMPTY);
+                    return;
+                }
+            }
+
+            if let Some(children) = self.directory_map.get_mut(&parent) {
+                children.remove(&name_str);
+            }
+
+            self.directory_map.remove(&ino);
+            self.inodes.remove(&ino);
+            // Ensure any blocks (if hypothetically assigned) are freed
+            self.free_inode_blocks(ino);
+
+            if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_str().unwrap().to_string();
 
@@ -240,38 +336,52 @@ impl Filesystem for MirageFS {
         };
 
         if let Some(ino) = ino_to_remove {
-            if let Some(inode) = self.inodes.remove(&ino) {
-                // COMPACTION: Swap-and-Pop to free blocks
-                for &free_block_idx in &inode.blocks {
-                    self.block_owner.remove(&free_block_idx);
+            self.free_inode_blocks(ino);
+            self.inodes.remove(&ino);
 
-                    let last_block_idx = self.disk_size_blocks - 1;
+            if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
 
-                    if free_block_idx == last_block_idx {
-                        self.disk_size_blocks -= 1;
-                    } else {
-                        // Move data from end of disk to the hole we just created
-                        if let Ok(data) = self.disk.read_block(last_block_idx) {
-                            if self.disk.write_block(free_block_idx, &data).is_ok() {
-                                // Update the owner of the moved block
-                                if let Some(&owner_ino) = self.block_owner.get(&last_block_idx) {
-                                    if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
-                                        for b in &mut owner_inode.blocks {
-                                            if *b == last_block_idx {
-                                                *b = free_block_idx;
-                                                break;
-                                            }
-                                        }
-                                        self.block_owner.remove(&last_block_idx);
-                                        self.block_owner.insert(free_block_idx, owner_ino);
-                                    }
+    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+        let name_str = name.to_str().unwrap().to_string();
+        let newname_str = newname.to_str().unwrap().to_string();
+
+        let ino_opt = self.directory_map.get(&parent)
+        .and_then(|c| c.get(&name_str).cloned());
+
+        if let Some(ino) = ino_opt {
+            // Handle overwrite at destination
+            let target_exists = self.directory_map.get(&newparent)
+            .map(|c| c.contains_key(&newname_str)).unwrap_or(false);
+
+            if target_exists {
+                if let Some(target_ino) = self.directory_map.get(&newparent).and_then(|c| c.get(&newname_str).cloned()) {
+                    if let Some(inode) = self.inodes.get(&target_ino) {
+                        if inode.attr.kind_is_dir {
+                            if let Some(c) = self.directory_map.get(&target_ino) {
+                                if !c.is_empty() {
+                                    reply.error(ENOTEMPTY);
+                                    return;
                                 }
                             }
+                            self.directory_map.remove(&target_ino);
+                            self.inodes.remove(&target_ino);
+                        } else {
+                            self.free_inode_blocks(target_ino);
+                            self.inodes.remove(&target_ino);
                         }
-                        self.disk_size_blocks -= 1;
                     }
                 }
             }
+
+            if let Some(children) = self.directory_map.get_mut(&parent) {
+                children.remove(&name_str);
+            }
+
+            self.directory_map.entry(newparent).or_default().insert(newname_str, ino);
 
             if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
         } else {
