@@ -34,8 +34,8 @@ struct Cli {
     image_files: Vec<PathBuf>,
     #[arg(short, long)]
     format: bool,
-    #[arg(short, long, action = ArgAction::Count)]
-    verbose: u8,
+        #[arg(short, long, action = ArgAction::Count)]
+        verbose: u8,
 }
 
 fn print_banner() {
@@ -133,7 +133,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Wrap in RAID Controller
-    let raid_controller = Raid0Device::new(disks)?;
+    // Passes `cli.format` so RAID controller can write or verify headers
+    let raid_controller = Raid0Device::new(disks, cli.format)?;
 
     // Pass the controller to the filesystem
     let uid = unsafe { libc::getuid() };
