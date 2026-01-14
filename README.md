@@ -20,7 +20,7 @@
 
 **MirageFS** is a high-stealth steganographic filesystem built in Rust. It allows you to format and mount standard image files (`.png`, `.jpg`, `.webp`) as fully functional read/write drives.
 
-Unlike traditional steganography tools that simply hide a static payload, MirageFS implements a **virtual block device** inside the image. This means you can interact with your hidden files in real-time using your OS's native file explorer (`cp`, `mv`, `vim`, `mkdir`, etc.) without extracting them first.
+Unlike traditional steganography tools that simply hide a static payload, MirageFS implements a **virtual block device** inside the image. This means you can interact with your hidden files in real-time using your OS's native file explorer (`cp`, `mv`, `vim`, `mkdir`, `rmdir`, etc.) without extracting them first.
 
 ## 🚀 Key Features
 
@@ -30,8 +30,9 @@ Your data is secured with state-of-the-art authenticated encryption.
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
 
-### ⛓️ Multi-Image RAID 0
-MirageFS supports **Stripe-Level Steganography**. You can combine multiple images into a single logical volume.
+### ⛓️ Strict Multi-Image RAID 0
+MirageFS supports **Stripe-Level Steganography** with strict integrity checks.
+* **Volume UUIDs:** Each drive in the array is cryptographically linked. The system refuses to mount if a drive is missing, swapped, or belongs to a different volume.
 * **Entropy Dilution:** A large file is fragmented across multiple carriers. Storing a 10MB file across 5 images results in only 2MB of modifications per image, significantly lowering the forensic "heat signature."
 * **Uniform Growth:** All carriers grow at the same rate, preventing one suspiciously large file among small ones.
 
@@ -44,9 +45,11 @@ MirageFS employs distinct, format-optimized strategies to defeat forensic analys
 | **JPEG** | **DNG Morphing** | Data is injected into `APP1` segments mimicking valid **Adobe DNG Private Data** (Tag `0xC634`) inside a standard TIFF structure. |
 | **WebP** | **RIFF Morphing** | Similar to JPEG, data is disguised as vendor-specific metadata inside the `EXIF` chunk of the RIFF container. |
 
-### 👻 Forensic Resistance
-* **Entropy Dilution:** Encrypted data is "diluted" (expanded) to lower its entropy density to ~7.0 bits/byte, making it statistically indistinguishable from standard camera metadata or sensor noise.
-* **Tool Blindness:** Standard forensic tools like `binwalk`, `zsteg`, and `foremost` fail to detect the filesystem because it lacks standard headers and structurally blends into the container.
+### 📂 Full Filesystem Semantics
+MirageFS is not just a key-value store; it is a compliant POSIX-like filesystem.
+* **Directory Support:** Create nested folders (`mkdir`), remove them (`rmdir`), and organize your data hierarchy.
+* **Atomic Renames:** Move and rename files/folders instantly (`mv`).
+* **Compaction:** Deleting a file triggers an automatic swap-and-pop mechanism to reclaim space and shrink the hidden volume size immediately.
 
 ---
 
@@ -106,8 +109,10 @@ mirage /tmp/secret part1.jpg part2.png part3.webp --format
 
 Unlock and mount the drive to access your files.
 
+> [!NOTE]
+> **Strict Ordering:** You must specify the same images in the **exact same order** used during formatting. MirageFS will verify the embedded UUIDs and refuse to mount if the order is incorrect.
+
 ```bash
-# Must specify the same images in the same order!
 mirage /tmp/secret part1.jpg part2.png part3.webp
 
 ```
@@ -136,9 +141,10 @@ MirageFS treats the PNG pixels as a domain of size . A custom **Feistel Network*
 
 When multiple images are provided, MirageFS creates a virtual striped volume.
 
+* **Reserved Header:** Physical Block 0 of *every* drive is reserved for an encrypted RAID header containing a volume UUID and device index.
 * **Mapping Algorithm:**
 * **Target Image:** `Logical_Block_Index % Image_Count`
-* **Target Block:** `Logical_Block_Index / Image_Count`
+* **Target Block:** `(Logical_Block_Index / Image_Count) + 1` (Offset protects the header)
 
 
 * **Benefit:** This defeats forensic analysis that looks for large contiguous blobs of high-entropy data. The payload is shattered into thousands of tiny, non-contiguous fragments scattered across different files.
