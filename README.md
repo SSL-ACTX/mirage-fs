@@ -6,7 +6,7 @@
 ![Version](https://img.shields.io/badge/version-1.3.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
 
 **Mount encrypted, hidden storage inside innocent media files.**
 
@@ -29,6 +29,12 @@ Your data is secured with state-of-the-art authenticated encryption.
 * **Cipher:** **XChaCha20-Poly1305** (Extended Nonce + MAC authentication).
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
+
+### 🌐 Universal Driverless Access (New!)
+MirageFS now includes an embedded **WebDAV Server**.
+* **No Drivers Required:** Works on restricted systems (corporate laptops, public computers) where you cannot install FUSE or kernel drivers.
+* **Network Capable:** Mount your hidden drive over the LAN or VPN.
+* **Cross-Platform:** Native integration with Windows Explorer, macOS Finder, iOS, and Android.
 
 ### ⛓️ Hybrid "Smart" RAID Controller
 MirageFS introduces a sophisticated **Tiered RAID 0** system that automatically balances stealth and capacity.
@@ -56,8 +62,10 @@ MirageFS is not just a key-value store; it is a compliant POSIX-like filesystem.
 
 ## 📦 Installation
 
-### 1. Prerequisites
-MirageFS relies on **FUSE (Filesystem in Userspace)**.
+MirageFS supports two modes: **Native FUSE** (High Performance) and **WebDAV** (High Compatibility).
+
+### Option 1: Native FUSE (Recommended for Linux/macOS)
+Requires **FUSE (Filesystem in Userspace)** drivers installed on the host.
 
 * **Debian/Ubuntu/WSL2:**
     ```bash
@@ -70,7 +78,10 @@ MirageFS relies on **FUSE (Filesystem in Userspace)**.
 * **macOS:**
     Install [macFUSE](https://macfuse.github.io/).
 
-### 2. Build from Source
+### Option 2: Portable / No-Driver Mode
+No dependencies required! MirageFS will automatically fallback to WebDAV mode if FUSE is not detected.
+
+### Build from Source
 ```bash
 # Clone the repository
 git clone https://github.com/SSL-ACTX/mirage-fs.git
@@ -106,26 +117,41 @@ mirage /tmp/secret cover.png movie.mp4 --format
 
 ```
 
-### 2️⃣ Mounting
+### 2️⃣ Mounting (Smart Detect)
 
-Unlock and mount the drive to access your files.
-
-> [!NOTE]
-> **Strict Ordering:** You must specify the same files in the **exact same order** used during formatting. MirageFS will verify the embedded UUIDs and refuse to mount if the order is incorrect.
+Run the command normally. MirageFS will attempt to mount via FUSE. If FUSE is unavailable (e.g., on Windows or restricted Linux), it will **automatically** start the WebDAV server.
 
 ```bash
 mirage /tmp/secret cover.png movie.mp4
 
 ```
 
-You can now open `/tmp/secret` in your file manager. Any file copied here is encrypted, fragmented, and embedded into the carrier files on the fly.
+### 3️⃣ WebDAV Mode (Manual)
 
-### 3️⃣ Unmounting
+You can force WebDAV mode (bypassing FUSE) to mount the drive as a Network Share. This is useful for systems without FUSE drivers.
+
+```bash
+# Start Server on Port 8080
+mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
+
+```
+
+**How to Access:**
+
+* **Windows:** Open File Explorer -> Right Click "This PC" -> "Map Network Drive" -> `http://127.0.0.1:8080`
+* **macOS:** Finder -> Go -> Connect to Server (`Cmd+K`) -> `http://127.0.0.1:8080`
+* **Linux (GNOME/Nautilus):** Files App -> Other Locations -> Connect to Server -> `dav://127.0.0.1:8080`
+* **Linux (CLI):** `mount -t davfs http://127.0.0.1:8080 /mnt/mountpoint`
+
+> [!NOTE] 
+> Do not use a web browser to visit the URL. Browsers issue `GET` requests on directories, which WebDAV servers reject (HTTP 405). You must use a WebDAV-compatible file manager.
+
+### 4️⃣ Unmounting
 
 To close the drive and flush all data:
 
 * **Press** `Ctrl + C` in the terminal.
-* **Or run:** `fusermount -u /tmp/secret`
+* **Or run:** `fusermount -u /tmp/secret` (FUSE mode only)
 
 ---
 
@@ -173,22 +199,23 @@ Works out of the box with standard FUSE installation.
 </details>
 
 <details>
-<summary><strong>🪟 Windows (WSL2)</strong></summary>
-MirageFS works perfectly in WSL2, allowing you to browse hidden files using <strong>Windows Explorer</strong>.
+<summary><strong>🪟 Windows (WSL2 / Native)</strong></summary>
+MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
-> **WSL2 Visibility Fix:**
-> If you cannot see files in Windows Explorer, ensure `/etc/fuse.conf` has `user_allow_other` uncommented.
-> 1. `sudo nano /etc/fuse.conf`
-> 2. Uncomment `user_allow_other`
-> 3. Navigate to `\\wsl$\Ubuntu\tmp\secret` in Explorer.
-> 
-> 
+1. Run MirageFS: `mirage.exe X: video.mp4 --webdav`
+2. Map the drive in Explorer to `http://127.0.0.1:8080`
+3. Enjoy your hidden drive as letter `Z:` (or similar).
+
+> **Legacy WSL2 FUSE:**
+> If you prefer FUSE inside WSL2, ensure `/etc/fuse.conf` has `user_allow_other` uncommented.
 
 </details>
 
 <details>
 <summary><strong>🍎 macOS</strong></summary>
-Requires <a href="https://macfuse.github.io/">macFUSE</a>. The code automatically detects UID/GID, but macOS security policies may require manual approval for FUSE kernel extensions in System Settings.
+
+* **Preferred:** Use WebDAV mode (`Cmd+K` -> `http://127.0.0.1:8080`) for zero-configuration access.
+* **FUSE:** Requires <a href="https://macfuse.github.io/">macFUSE</a> and manual approval of kernel extensions in System Settings.
 </details>
 
 ---

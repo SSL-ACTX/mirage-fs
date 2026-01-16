@@ -3,8 +3,12 @@ name = "mirage"
 version = "1.3.0"
 edition = "2021"
 
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser"]
+
 [dependencies]
-fuser = "0.12"
+fuser = { version = "0.12", optional = true }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.10"
@@ -22,6 +26,13 @@ flate2 = "1.0"
 hex = "0.4.3"
 rand_chacha = "0.3"
 ctrlc = "3.5.1"
+dav-server = "0.7.0"
+tokio = { version = "1.0", features = ["full"] }
+headers = "0.3"
+hyper = "1.8.1"
+bytes = "1.11.0"
+futures = "0.3.31"
+hyper-util = { version = "0.1.19", features = ["tokio", "server", "server-auto", "http1"] }
 
 [profile.dev]
 strip = true

@@ -1,12 +1,14 @@
 // src/main.rs
 use clap::{Parser, ArgAction};
-use fuser::MountOption;
-use log::{info, error, LevelFilter};
-use std::fs;
+use log::{info, error, warn, LevelFilter};
 use std::path::PathBuf;
 use std::io::{self, Write};
 use env_logger::Builder;
 use std::process::Command;
+#[cfg(feature = "fuse")]
+use fuser::MountOption;
+#[cfg(feature = "fuse")]
+use std::fs;
 
 mod block_device;
 mod raid_device;
@@ -15,6 +17,7 @@ mod png_disk;
 mod jpeg_disk;
 mod webp_disk;
 mod mp4_disk;
+mod webdav_server;
 
 use block_device::BlockDevice;
 use raid_device::Raid0Device;
@@ -28,16 +31,20 @@ use mp4_disk::Mp4Disk;
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
 #[command(version = "1.3.0")]
-#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard media files.\n\nSupports Multi-Image RAID 0 (Striping) for heat distribution.")]
+#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files.")]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
     mount_point: PathBuf,
     #[arg(value_name = "MEDIA_FILES", required = true, num_args = 1..)]
-    media_files: Vec<PathBuf>,
+    image_files: Vec<PathBuf>,
     #[arg(short, long)]
     format: bool,
-        #[arg(short, long, action = ArgAction::Count)]
-        verbose: u8,
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+    #[arg(short, long, help = "Serve via WebDAV instead of mounting (No FUSE required)")]
+    webdav: bool,
+    #[arg(long, default_value = "8080", help = "Port for WebDAV server")]
+    port: u16,
 }
 
 fn print_banner() {
@@ -46,7 +53,7 @@ fn print_banner() {
     ██ ▀▀ ██ ██ ██▄█▄ ██▀██ ██ ▄▄ ██▄▄  ██▄▄   ▀▀▀▄▄▄
     ██    ██ ██ ██ ██ ██▀██ ▀███▀ ██▄▄▄ ██     █████▀
 
-    v1.2.0 | By Seuriin (SSL-ACTX)
+    v1.3.0 | By Seuriin (SSL-ACTX)
     "#);
 }
 
@@ -73,6 +80,7 @@ fn init_logger(verbosity: u8) {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Initialize Logging
     if std::env::var("RUST_LOG").is_err() {
         let v = if cli.verbose == 0 { 1 } else { cli.verbose };
         init_logger(v);
@@ -82,12 +90,28 @@ fn main() -> anyhow::Result<()> {
 
     print_banner();
 
-    if !cli.mount_point.exists() {
-        info!("Creating mount point at {:?}", cli.mount_point);
-        fs::create_dir_all(&cli.mount_point)?;
+    // --- Pre-Flight Checks ---
+
+    // Verify Media Files Exist
+    for path in &cli.image_files {
+        if !path.exists() {
+            anyhow::bail!("Media file not found: {:?}", path);
+        }
     }
 
-    // Password Prompt
+    // Prepare Mount Point (Only for FUSE mode)
+    #[cfg(feature = "fuse")]
+    if !cli.webdav {
+        if !cli.mount_point.exists() {
+            info!("Creating mount point at {:?}", cli.mount_point);
+            fs::create_dir_all(&cli.mount_point)?;
+        }
+        if !cli.mount_point.is_dir() {
+            anyhow::bail!("Mount point must be a directory: {:?}", cli.mount_point);
+        }
+    }
+
+    // --- Password Interaction ---
     print!("[-] Enter Password: ");
     io::stdout().flush()?;
     let password = rpassword::read_password()?;
@@ -101,16 +125,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Initialize all disks
+    // --- Initialize Storage Layer ---
     let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
+    info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
 
-    info!("Initializing storage array with {} carrier(s)...", cli.media_files.len());
-
-    for path in cli.media_files {
-        if !path.exists() {
-            anyhow::bail!("Image file '{:?}' not found.", path);
-        }
-
+    for path in cli.image_files {
         let extension = path.extension()
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase())
@@ -119,33 +138,23 @@ fn main() -> anyhow::Result<()> {
         info!("Loading carrier: {:?}", path);
 
         let disk: Box<dyn BlockDevice> = match extension.as_str() {
-            "png" => {
-                Box::new(PngDisk::new(path, &password, cli.format)?)
-            },
-            "jpg" | "jpeg" => {
-                Box::new(JpegDisk::new(path, &password, cli.format)?)
-            },
-            "webp" => {
-                Box::new(WebPDisk::new(path, &password, cli.format)?)
-            },
-            "mp4" | "m4v" | "mov" => {
-                Box::new(Mp4Disk::new(path, &password, cli.format)?)
-            },
+            "png" => Box::new(PngDisk::new(path, &password, cli.format)?),
+            "jpg" | "jpeg" => Box::new(JpegDisk::new(path, &password, cli.format)?),
+            "webp" => Box::new(WebPDisk::new(path, &password, cli.format)?),
+            "mp4" | "m4v" | "mov" => Box::new(Mp4Disk::new(path, &password, cli.format)?),
             _ => anyhow::bail!("Unsupported file extension: .{}", extension),
         };
 
         disks.push(disk);
     }
 
-    // Wrap in RAID Controller
+    // Initialize RAID Controller
     let raid_controller = Raid0Device::new(disks, cli.format)?;
 
-    // Pass the controller to the filesystem
+    // Initialize Filesystem
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    // MirageFS sees the RAID array as a single, large block device.
-    // It doesn't know (or care) that the data is being striped.
     let fs = match MirageFS::new(Box::new(raid_controller), cli.format, uid, gid) {
         Ok(fs) => fs,
         Err(e) => {
@@ -154,6 +163,39 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // --- Launch Mode Selection ---
+
+    if cli.webdav {
+        return run_webdav(fs, cli.port);
+    }
+
+    #[cfg(feature = "fuse")]
+    {
+        run_fuse(fs, cli.mount_point)
+    }
+
+    #[cfg(not(feature = "fuse"))]
+    {
+        info!("MirageFS compiled without FUSE support. Defaulting to WebDAV.");
+        run_webdav(fs, cli.port)
+    }
+}
+
+// --- Mode Implementations ---
+
+fn run_webdav(fs: MirageFS, port: u16) -> anyhow::Result<()> {
+    info!("Starting WebDAV Mode (FUSE Disabled)...");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        webdav_server::start_webdav_server(fs, port).await;
+    });
+
+    Ok(())
+}
+
+#[cfg(feature = "fuse")]
+fn run_fuse(fs: MirageFS, mount_point: PathBuf) -> anyhow::Result<()> {
     let options = vec![
         MountOption::RW,
         MountOption::FSName("mirage".to_string()),
@@ -162,12 +204,15 @@ fn main() -> anyhow::Result<()> {
         MountOption::DefaultPermissions,
     ];
 
-    info!("Mounting at {:?}", cli.mount_point);
+    info!("Mounting at {:?}", mount_point);
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
     info!("Owner: UID={}, GID={}", uid, gid);
     info!("Press Ctrl+C to unmount.");
 
-    let mount_path = cli.mount_point.clone();
+    let mount_path = mount_point.clone();
 
+    // Signal Handler for Clean Unmount
     ctrlc::set_handler(move || {
         info!("\n[!] Received Ctrl+C. Force unmounting...");
         let status = Command::new("fusermount")
@@ -177,17 +222,22 @@ fn main() -> anyhow::Result<()> {
         .status();
 
         if status.is_err() || !status.unwrap().success() {
+            // Fallback for non-FUSE systems or weird states
             let _ = Command::new("umount")
             .arg(&mount_path)
             .status();
         }
     }).ok();
 
-    if let Err(e) = fuser::mount2(fs, cli.mount_point, &options) {
-        error!("Mount failed: {}", e);
-        return Ok(());
+    match fuser::mount2(fs, mount_point, &options) {
+        Ok(_) => {
+            info!("Unmounted successfully.");
+            Ok(())
+        },
+        Err(e) => {
+            error!("FUSE Mount Failed: {}", e);
+            warn!("If FUSE is not installed, try running with --webdav");
+            Err(anyhow::anyhow!("FUSE mount failed"))
+        }
     }
-
-    info!("Unmounted successfully.");
-    Ok(())
 }

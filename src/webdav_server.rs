@@ -1,0 +1,463 @@
+// src/webdav_server.rs
+use crate::mirage_fs::{MirageFS, MirageFileType};
+use dav_server::{
+    fs::{DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, OpenOptions},
+    davpath::DavPath,
+    DavHandler,
+};
+use std::sync::{Arc, Mutex};
+use std::io::SeekFrom;
+use std::net::SocketAddr;
+use std::time::SystemTime;
+use futures::FutureExt;
+use bytes::{Bytes, Buf};
+use dav_server::fakels::FakeLs;
+
+// --- Error Mapping Helper ---
+fn map_err(code: i32) -> FsError {
+    match code {
+        libc::ENOENT => FsError::NotFound,
+        libc::EEXIST => FsError::Exists,
+        libc::EACCES | libc::EPERM => FsError::Forbidden,
+        libc::ENOTEMPTY => FsError::Forbidden,
+        _ => FsError::GeneralFailure,
+    }
+}
+
+// --- Helper Structs ---
+
+#[derive(Clone)]
+pub struct MirageWebDav {
+    fs: Arc<Mutex<MirageFS>>,
+}
+
+impl MirageWebDav {
+    pub fn new(fs: MirageFS) -> Self {
+        Self {
+            fs: Arc::new(Mutex::new(fs)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MirageMetaData {
+    len: u64,
+    modified: SystemTime,
+    is_dir: bool,
+}
+
+impl DavMetaData for MirageMetaData {
+    fn len(&self) -> u64 { self.len }
+    fn modified(&self) -> FsResult<SystemTime> { Ok(self.modified) }
+    fn is_dir(&self) -> bool { self.is_dir }
+    fn created(&self) -> FsResult<SystemTime> { Ok(self.modified) }
+}
+
+#[derive(Clone, Debug)]
+pub struct MirageDirEntry {
+    name: Vec<u8>,
+    meta: MirageMetaData,
+}
+
+impl DavDirEntry for MirageDirEntry {
+    fn name(&self) -> Vec<u8> {
+        self.name.clone()
+    }
+
+    fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let meta = self.meta.clone();
+        async move {
+            Ok(Box::new(meta) as Box<dyn DavMetaData>)
+        }.boxed()
+    }
+}
+
+#[derive(Debug)]
+pub struct MirageDavFile {
+    fs: Arc<Mutex<MirageFS>>,
+    ino: u64,
+    current_pos: u64,
+}
+
+// --- DavFile Implementation ---
+impl DavFile for MirageDavFile {
+    fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
+        let fs = self.fs.clone();
+        let ino = self.ino;
+        let pos = self.current_pos;
+
+        async move {
+            let read_result = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                locked_fs.read_data_internal(ino, pos, count as u32)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+
+            match read_result {
+                Ok(data) => {
+                    self.current_pos += data.len() as u64;
+                    Ok(Bytes::from(data))
+                },
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        let ino = self.ino;
+        let pos = self.current_pos;
+
+        async move {
+            let write_result = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                locked_fs.write_data_internal(ino, pos, &buf)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+
+            match write_result {
+                Ok(written) => {
+                    self.current_pos += written as u64;
+                    Ok(())
+                },
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn write_buf(&mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        let ino = self.ino;
+        let mut pos = self.current_pos;
+
+        async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let mut total_advanced = 0;
+
+                while buf.has_remaining() {
+                    let chunk = buf.chunk();
+                    let len = chunk.len();
+                    match locked_fs.write_data_internal(ino, pos, chunk) {
+                        Ok(written) => {
+                            buf.advance(written);
+                            pos += written as u64;
+                            total_advanced += written as u64;
+                            if written < len {
+                                return Err(FsError::GeneralFailure);
+                            }
+                        },
+                        Err(e) => return Err(map_err(e)),
+                    }
+                }
+                Ok(total_advanced)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+
+            match result {
+                Ok(advanced) => {
+                    self.current_pos += advanced;
+                    Ok(())
+                },
+                Err(e) => Err(e),
+            }
+        }.boxed()
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
+        let fs = self.fs.clone();
+        let ino = self.ino;
+        let current_pos = self.current_pos;
+
+        async move {
+            let size = tokio::task::spawn_blocking(move || {
+                let locked_fs = fs.lock().unwrap();
+                locked_fs.get_inode_size(ino).unwrap_or(0)
+            }).await.map_err(|_| FsError::GeneralFailure)?;
+
+            let new_pos = match pos {
+                SeekFrom::Start(p) => p,
+                SeekFrom::Current(p) => (current_pos as i64 + p) as u64,
+                SeekFrom::End(p) => (size as i64 + p) as u64,
+            };
+
+            self.current_pos = new_pos;
+            Ok(new_pos)
+        }.boxed()
+    }
+
+    fn flush(&mut self) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let _ = locked_fs.sync_disk();
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+            Ok(())
+        }.boxed()
+    }
+
+    fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let fs = self.fs.clone();
+        let ino = self.ino;
+        async move {
+            let meta = tokio::task::spawn_blocking(move || {
+                let locked_fs = fs.lock().unwrap();
+                if let Some(inode) = locked_fs.get_inode(ino) {
+                    Ok(MirageMetaData {
+                        len: inode.attr.size,
+                        modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(inode.attr.mtime_secs),
+                       is_dir: match inode.attr.kind { MirageFileType::Directory => true, _ => false },
+                    })
+                } else {
+                    Err(FsError::NotFound)
+                }
+            }).await.map_err(|_| FsError::GeneralFailure)?;
+
+            match meta {
+                Ok(m) => Ok(Box::new(m) as Box<dyn DavMetaData>),
+                Err(e) => Err(e),
+            }
+        }.boxed()
+    }
+}
+
+// --- DavFileSystem Implementation ---
+impl DavFileSystem for MirageWebDav {
+    fn open(&self, path: &DavPath, options: OpenOptions) -> FsFuture<'_, Box<dyn DavFile>> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+
+        async move {
+            let fs_for_task = fs.clone();
+            let ino_opt = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs_for_task.lock().unwrap();
+
+                if options.create {
+                    let p = std::path::Path::new(&path_str);
+                    if let Some(parent) = p.parent() {
+                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if let Ok(parent_ino) = locked_fs.resolve_path(parent) {
+                            if let Ok(existing) = locked_fs.resolve_path(p) {
+                                return Ok(existing);
+                            }
+                            if let Ok(new_ino) = locked_fs.create_file_internal(parent_ino, name) {
+                                return Ok(new_ino);
+                            }
+                        }
+                    }
+                }
+
+                locked_fs.resolve_path(std::path::Path::new(&path_str))
+            }).await.unwrap();
+
+            match ino_opt {
+                Ok(ino) => Ok(Box::new(MirageDavFile { fs: fs, ino, current_pos: 0 }) as Box<dyn DavFile>),
+                Err(_) => Err(FsError::NotFound),
+            }
+        }.boxed()
+    }
+
+    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: dav_server::fs::ReadDirMeta) -> FsFuture<'a, std::pin::Pin<Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>>> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+
+        async move {
+            let entries = tokio::task::spawn_blocking(move || {
+                let locked_fs = fs.lock().unwrap();
+                if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
+                    locked_fs.readdir_internal(ino)
+                } else {
+                    Vec::new()
+                }
+            }).await.unwrap();
+
+            let stream = futures::stream::iter(entries.into_iter().map(|(_ino, name, kind)| {
+                let meta = MirageMetaData {
+                    len: 0,
+                    modified: SystemTime::now(),
+                                                                       is_dir: match kind { MirageFileType::Directory => true, _ => false }
+                };
+
+                let entry = MirageDirEntry {
+                    name: name.into_bytes(),
+                                                                       meta,
+                };
+
+                Ok(Box::new(entry) as Box<dyn DavDirEntry>)
+            }));
+
+            Ok(Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>>)
+        }.boxed()
+    }
+
+    fn metadata(&self, path: &DavPath) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+
+        async move {
+            let meta = tokio::task::spawn_blocking(move || {
+                let locked_fs = fs.lock().unwrap();
+                if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
+                    if let Some(inode) = locked_fs.get_inode(ino) {
+                        return Ok(MirageMetaData {
+                            len: inode.attr.size,
+                            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(inode.attr.mtime_secs),
+                                  is_dir: match inode.attr.kind { MirageFileType::Directory => true, _ => false },
+                        });
+                    }
+                }
+                Err(libc::ENOENT)
+            }).await.unwrap();
+
+            match meta {
+                Ok(m) => Ok(Box::new(m) as Box<dyn DavMetaData>),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn create_dir(&self, path: &DavPath) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let p = std::path::Path::new(&path_str);
+                if let Some(parent) = p.parent() {
+                    let name = p.file_name().unwrap().to_str().unwrap();
+                    if let Ok(parent_ino) = locked_fs.resolve_path(parent) {
+                        return locked_fs.mkdir_internal(parent_ino, name);
+                    }
+                }
+                Err(libc::EIO)
+            }).await.unwrap();
+
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let p = std::path::Path::new(&path_str);
+                if let Some(parent) = p.parent() {
+                    let name = p.file_name().unwrap().to_str().unwrap();
+                    if let Ok(parent_ino) = locked_fs.resolve_path(parent) {
+                        return locked_fs.rmdir_internal(parent_ino, name);
+                    }
+                }
+                Err(libc::ENOENT)
+            }).await.unwrap();
+
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
+        let fs = self.fs.clone();
+        let path_str = path.as_pathbuf().to_string_lossy().to_string();
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let p = std::path::Path::new(&path_str);
+                if let Some(parent) = p.parent() {
+                    let name = p.file_name().unwrap().to_str().unwrap();
+                    if let Ok(parent_ino) = locked_fs.resolve_path(parent) {
+                        return locked_fs.unlink_internal(parent_ino, name);
+                    }
+                }
+                Err(libc::ENOENT)
+            }).await.unwrap();
+
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn rename(&self, from: &DavPath, to: &DavPath) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        let from_str = from.as_pathbuf().to_string_lossy().to_string();
+        let to_str = to.as_pathbuf().to_string_lossy().to_string();
+
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+                let p_from = std::path::Path::new(&from_str);
+                let p_to = std::path::Path::new(&to_str);
+
+                let parent_from = p_from.parent().ok_or(libc::EIO)?;
+                let name_from = p_from.file_name().ok_or(libc::EIO)?.to_str().unwrap();
+
+                let parent_to = p_to.parent().ok_or(libc::EIO)?;
+                let name_to = p_to.file_name().ok_or(libc::EIO)?.to_str().unwrap();
+
+                let parent_ino_from = locked_fs.resolve_path(parent_from).map_err(|e| e)?;
+                let parent_ino_to = locked_fs.resolve_path(parent_to).map_err(|e| e)?;
+
+                locked_fs.rename_internal(parent_ino_from, name_from, parent_ino_to, name_to)
+            }).await.unwrap();
+
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
+    }
+
+    fn copy(&self, _from: &DavPath, _to: &DavPath) -> FsFuture<'_, ()> {
+        async { Err(FsError::NotImplemented) }.boxed()
+    }
+}
+
+pub async fn start_webdav_server(fs: MirageFS, port: u16) {
+    let dav_server = DavHandler::builder()
+    .filesystem(Box::new(MirageWebDav::new(fs)))
+    .locksystem(FakeLs::new())
+    .build_handler();
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("🌐 WebDAV Server running at http://{}/", addr);
+    println!("   -> Windows: Map Network Drive to http://127.0.0.1:{}", port);
+    println!("   -> macOS:   Cmd+K > http://127.0.0.1:{}", port);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let dav_server = dav_server.clone();
+
+        tokio::task::spawn(async move {
+            let service = hyper::service::service_fn(move |req| {
+                let dav_server = dav_server.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(dav_server.handle(req).await)
+                }
+            });
+
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+        });
+    }
+}
