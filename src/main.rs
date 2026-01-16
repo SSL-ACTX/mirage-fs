@@ -14,6 +14,7 @@ mod mirage_fs;
 mod png_disk;
 mod jpeg_disk;
 mod webp_disk;
+mod mp4_disk;
 
 use block_device::BlockDevice;
 use raid_device::Raid0Device;
@@ -21,17 +22,18 @@ use mirage_fs::MirageFS;
 use png_disk::PngDisk;
 use jpeg_disk::JpegDisk;
 use webp_disk::WebPDisk;
+use mp4_disk::Mp4Disk;
 
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
-#[command(version = "1.2.0")]
-#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image files.\n\nSupports Multi-Image RAID 0 (Striping) for heat distribution.")]
+#[command(version = "1.3.0")]
+#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard media files.\n\nSupports Multi-Image RAID 0 (Striping) for heat distribution.")]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
     mount_point: PathBuf,
-    #[arg(value_name = "IMAGE_FILES", required = true, num_args = 1..)]
-    image_files: Vec<PathBuf>,
+    #[arg(value_name = "MEDIA_FILES", required = true, num_args = 1..)]
+    media_files: Vec<PathBuf>,
     #[arg(short, long)]
     format: bool,
         #[arg(short, long, action = ArgAction::Count)]
@@ -102,9 +104,9 @@ fn main() -> anyhow::Result<()> {
     // Initialize all disks
     let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
 
-    info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
+    info!("Initializing storage array with {} carrier(s)...", cli.media_files.len());
 
-    for path in cli.image_files {
+    for path in cli.media_files {
         if !path.exists() {
             anyhow::bail!("Image file '{:?}' not found.", path);
         }
@@ -126,6 +128,9 @@ fn main() -> anyhow::Result<()> {
             "webp" => {
                 Box::new(WebPDisk::new(path, &password, cli.format)?)
             },
+            "mp4" | "m4v" | "mov" => {
+                Box::new(Mp4Disk::new(path, &password, cli.format)?)
+            },
             _ => anyhow::bail!("Unsupported file extension: .{}", extension),
         };
 
@@ -133,7 +138,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Wrap in RAID Controller
-    // Passes `cli.format` so RAID controller can write or verify headers
     let raid_controller = Raid0Device::new(disks, cli.format)?;
 
     // Pass the controller to the filesystem

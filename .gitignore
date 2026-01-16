@@ -7,3 +7,7 @@ target/
 *.jpg
 *.png
 *.webp
+*.mp4
+*.mov
+*.m4v
+*.mkv

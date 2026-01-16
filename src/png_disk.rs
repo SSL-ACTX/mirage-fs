@@ -92,6 +92,7 @@ pub struct PngDisk {
     cipher: ChaCha20Poly1305,
     permutator: FeistelPermutator,
     salt_indices: HashSet<u32>,
+    sorted_salt_indices: Vec<u32>,
 }
 
 impl PngDisk {
@@ -111,7 +112,11 @@ impl PngDisk {
         // 1. Locate Salt (Password Derived)
         debug!("Deriving salt locations...");
         let loc_seed = Self::derive_location_seed(password)?;
-        let salt_vec = Self::generate_salt_indices(loc_seed, total_channels as u32);
+        let mut salt_vec = Self::generate_salt_indices(loc_seed, total_channels as u32);
+
+        // Sort salt indices for deterministic shifting
+        salt_vec.sort();
+        let sorted_salt_indices = salt_vec.clone();
         let salt_indices: HashSet<u32> = salt_vec.iter().cloned().collect();
 
         let mut salt = [0u8; 16];
@@ -156,7 +161,7 @@ impl PngDisk {
         // 4. Initialize Permutator
         let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
 
-        let disk = PngDisk { img, path, cipher, permutator, salt_indices };
+        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices };
 
         // 5. Integrity Check
         if !format {
@@ -198,10 +203,26 @@ impl PngDisk {
 
     #[inline(always)]
     fn map_logical_to_physical(&self, logical_index: u32) -> u32 {
-        let mut physical = self.permutator.permute(logical_index);
+        // S1: Skip Salt Indices in the INPUT domain.
+        // This ensures we never use a Salt Index as an input to the permutator.
+        let mut adjusted_index = logical_index;
+        for &salt_idx in &self.sorted_salt_indices {
+            if adjusted_index >= salt_idx {
+                adjusted_index += 1;
+            } else {
+                // Sorted, so we can stop early
+                break;
+            }
+        }
+
+        // S2: Permute the adjusted index.
+        let mut physical = self.permutator.permute(adjusted_index);
+
+        // S3: Handle Output Collisions (Cycle Walking).
         while self.salt_indices.contains(&physical) {
             physical = self.permutator.permute(physical);
         }
+
         physical
     }
 
