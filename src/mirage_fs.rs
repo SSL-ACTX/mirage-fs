@@ -405,10 +405,6 @@ impl MirageFS {
             // Update mtime
             inode.attr.mtime_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         }
-
-        // Auto-sync for stability
-        let _ = self.save_metadata();
-
         Ok(total_written)
     }
 
