@@ -3,7 +3,7 @@
 ![MirageFS Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:FF4500&height=220&section=header&text=MirageFS&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=2&stroke=FF4500&strokeWidth=2&desc=The%20Invisible%20Filesystem&descSize=20&descAlignY=60)
 
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.4.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
@@ -30,8 +30,14 @@ Your data is secured with state-of-the-art authenticated encryption.
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
 
-### 🌐 Universal Driverless Access (New!)
-MirageFS now includes an embedded **WebDAV Server**.
+### 🖥️ Embedded Web Interface (New!)
+MirageFS now ships with a stunning, self-hosted **Web Management UI** served directly from the binary.
+* **Visual File Manager:** Navigate folders, view file details, and manage storage with a modern web UI.
+* **Drag & Drop Upload:** Encrypt files instantly by dragging them into the browser window.
+* **Zero Client Setup:** Works on any device with a web browser (Mobile/Desktop) without installing WebDAV clients.
+
+### 🌐 Universal Driverless Access
+MirageFS includes an embedded **WebDAV Server**.
 * **No Drivers Required:** Works on restricted systems (corporate laptops, public computers) where you cannot install FUSE or kernel drivers.
 * **Network Capable:** Mount your hidden drive over the LAN or VPN.
 * **Cross-Platform:** Native integration with Windows Explorer, macOS Finder, iOS, and Android.
@@ -93,6 +99,7 @@ cargo build --release
 # (Optional) Install globally
 sudo cp target/release/mirage /usr/local/bin/mirage
 
+
 ```
 
 ---
@@ -115,6 +122,7 @@ mirage /tmp/secret holiday_video.mp4 --format
 # Hybrid Mode (Best Stealth: Image + Video Striping)
 mirage /tmp/secret cover.png movie.mp4 --format
 
+
 ```
 
 ### 2️⃣ Mounting (Smart Detect)
@@ -124,15 +132,26 @@ Run the command normally. MirageFS will attempt to mount via FUSE. If FUSE is un
 ```bash
 mirage /tmp/secret cover.png movie.mp4
 
+
 ```
 
-### 3️⃣ WebDAV Mode (Manual)
+### 3️⃣ Web UI (Browser Access)
+
+You can access the new graphical interface by opening the server address in any web browser.
+
+**Link:** `http://127.0.0.1:8080` (Default)
+
+* **Drag & Drop:** Upload files instantly.
+* **Manage:** Create folders, delete items, and browse your hidden filesystem.
+
+### 4️⃣ WebDAV Mode (Manual / Network Share)
 
 You can force WebDAV mode (bypassing FUSE) to mount the drive as a Network Share. This is useful for systems without FUSE drivers.
 
 ```bash
 # Start Server on Port 8080
 mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
+
 
 ```
 
@@ -143,10 +162,10 @@ mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
 * **Linux (GNOME/Nautilus):** Files App -> Other Locations -> Connect to Server -> `dav://127.0.0.1:8080`
 * **Linux (CLI):** `mount -t davfs http://127.0.0.1:8080 /mnt/mountpoint`
 
-> [!NOTE] 
-> Do not use a web browser to visit the URL. Browsers issue `GET` requests on directories, which WebDAV servers reject (HTTP 405). You must use a WebDAV-compatible file manager.
+> [!NOTE]
+> Visiting the root URL (`http://127.0.0.1:8080`) in a browser loads the **Web UI**. To mount the filesystem as a native drive in your OS, you must use the "Connect to Server" / "Map Network Drive" feature of your file manager, not a web browser.
 
-### 4️⃣ Unmounting
+### 5️⃣ Unmounting
 
 To close the drive and flush all data:
 
@@ -216,6 +235,7 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 * **Preferred:** Use WebDAV mode (`Cmd+K` -> `http://127.0.0.1:8080`) for zero-configuration access.
 * **FUSE:** Requires <a href="https://macfuse.github.io/">macFUSE</a> and manual approval of kernel extensions in System Settings.
+
 </details>
 
 ---
@@ -236,6 +256,6 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 **Author:** Seuriin ([SSL-ACTX](https://github.com/SSL-ACTX))
 
-*v1.3.0*
+*v1.4.0*
 
 </div>
