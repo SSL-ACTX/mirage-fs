@@ -105,64 +105,36 @@ impl DavFile for MirageDavFile {
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
-        let fs = self.fs.clone();
-        let ino = self.ino;
-        let pos = self.current_pos;
-
-        async move {
-            let write_result = tokio::task::spawn_blocking(move || {
-                let mut locked_fs = fs.lock().unwrap();
-                locked_fs.write_data_internal(ino, pos, &buf)
-            })
-            .await
-            .map_err(|_| FsError::GeneralFailure)?;
-
-            match write_result {
-                Ok(written) => {
-                    self.current_pos += written as u64;
-                    Ok(())
-                },
-                Err(e) => Err(map_err(e)),
-            }
-        }.boxed()
+        let b = Box::new(buf);
+        self.write_buf(b)
     }
 
     fn write_buf(&mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
         let fs = self.fs.clone();
         let ino = self.ino;
-        let mut pos = self.current_pos;
+        let pos = self.current_pos;
 
         async move {
+            let mut data_to_write = Vec::new();
+            while buf.has_remaining() {
+                let chunk = buf.chunk();
+                data_to_write.extend_from_slice(chunk);
+                buf.advance(chunk.len());
+            }
+
             let result = tokio::task::spawn_blocking(move || {
                 let mut locked_fs = fs.lock().unwrap();
-                let mut total_advanced = 0;
-
-                while buf.has_remaining() {
-                    let chunk = buf.chunk();
-                    let len = chunk.len();
-                    match locked_fs.write_data_internal(ino, pos, chunk) {
-                        Ok(written) => {
-                            buf.advance(written);
-                            pos += written as u64;
-                            total_advanced += written as u64;
-                            if written < len {
-                                return Err(FsError::GeneralFailure);
-                            }
-                        },
-                        Err(e) => return Err(map_err(e)),
-                    }
-                }
-                Ok(total_advanced)
+                locked_fs.write_data_internal(ino, pos, &data_to_write)
             })
             .await
             .map_err(|_| FsError::GeneralFailure)?;
 
             match result {
-                Ok(advanced) => {
-                    self.current_pos += advanced;
+                Ok(written) => {
+                    self.current_pos += written as u64;
                     Ok(())
                 },
-                Err(e) => Err(e),
+                Err(e) => Err(map_err(e)),
             }
         }.boxed()
     }
@@ -192,13 +164,18 @@ impl DavFile for MirageDavFile {
     fn flush(&mut self) -> FsFuture<'_, ()> {
         let fs = self.fs.clone();
         async move {
-            tokio::task::spawn_blocking(move || {
+            let res = tokio::task::spawn_blocking(move || {
                 let mut locked_fs = fs.lock().unwrap();
-                let _ = locked_fs.sync_disk();
+                locked_fs.sync_disk()
             })
             .await
             .map_err(|_| FsError::GeneralFailure)?;
-            Ok(())
+
+            if res == 0 {
+                Ok(())
+            } else {
+                Err(FsError::GeneralFailure)
+            }
         }.boxed()
     }
 
@@ -243,7 +220,13 @@ impl DavFileSystem for MirageWebDav {
                     if let Some(parent) = p.parent() {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if let Ok(parent_ino) = locked_fs.resolve_path(parent) {
+                            // Check if exists
                             if let Ok(existing) = locked_fs.resolve_path(p) {
+                                // Truncate if requested
+                                if options.truncate {
+                                    // Assuming size 0 implies truncate start
+                                    let _ = locked_fs.set_attr_internal(existing, Some(0), None, None);
+                                }
                                 return Ok(existing);
                             }
                             if let Ok(new_ino) = locked_fs.create_file_internal(parent_ino, name) {
@@ -278,6 +261,7 @@ impl DavFileSystem for MirageWebDav {
             }).await.unwrap();
 
             let stream = futures::stream::iter(entries.into_iter().map(|(_ino, name, kind)| {
+                // Return dummy metadata for listing; real metadata fetched on demand
                 let meta = MirageMetaData {
                     len: 0,
                     modified: SystemTime::now(),
@@ -421,8 +405,51 @@ impl DavFileSystem for MirageWebDav {
         }.boxed()
     }
 
-    fn copy(&self, _from: &DavPath, _to: &DavPath) -> FsFuture<'_, ()> {
-        async { Err(FsError::NotImplemented) }.boxed()
+    fn copy(&self, from: &DavPath, to: &DavPath) -> FsFuture<'_, ()> {
+        let fs = self.fs.clone();
+        let from_str = from.as_pathbuf().to_string_lossy().to_string();
+        let to_str = to.as_pathbuf().to_string_lossy().to_string();
+
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut locked_fs = fs.lock().unwrap();
+
+                // 1. Resolve Source
+                let src_ino = locked_fs.resolve_path(std::path::Path::new(&from_str)).map_err(|_| libc::ENOENT)?;
+
+                // 2. Resolve Dest Parent
+                let p_to = std::path::Path::new(&to_str);
+                let parent_to = p_to.parent().ok_or(libc::EIO)?;
+                let name_to = p_to.file_name().ok_or(libc::EIO)?.to_str().unwrap();
+                let parent_ino_to = locked_fs.resolve_path(parent_to).map_err(|_| libc::ENOENT)?;
+
+                // 3. Create Dest File
+                let dest_ino = locked_fs.create_file_internal(parent_ino_to, name_to).map_err(|e| e)?;
+
+                // 4. Perform Deep Copy (Read Src -> Write Dest)
+                let size = locked_fs.get_inode_size(src_ino).unwrap_or(0);
+                let mut offset = 0;
+                let chunk_size = 64 * 1024; // 64KB chunks
+
+                while offset < size {
+                    let read_len = std::cmp::min(chunk_size, (size - offset) as u32);
+                    if let Ok(data) = locked_fs.read_data_internal(src_ino, offset, read_len) {
+                        if let Err(_) = locked_fs.write_data_internal(dest_ino, offset, &data) {
+                            return Err(libc::EIO);
+                        }
+                        offset += data.len() as u64;
+                    } else {
+                        return Err(libc::EIO);
+                    }
+                }
+                Ok(())
+            }).await.unwrap();
+
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(map_err(e)),
+            }
+        }.boxed()
     }
 }
 
@@ -434,8 +461,7 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("🌐 WebDAV Server running at http://{}/", addr);
-    println!("   -> Windows: Map Network Drive to http://127.0.0.1:{}", port);
-    println!("   -> macOS:   Cmd+K > http://127.0.0.1:{}", port);
+    println!("   -> Connect to http://127.0.0.1:{}", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 

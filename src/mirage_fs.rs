@@ -7,7 +7,7 @@ use fuser::{
 };
 #[cfg(feature = "fuse")]
 use std::ffi::OsStr;
-use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY, EACCES};
+use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,12 +16,15 @@ use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
 use flate2::Compression;
 use std::path::Path;
+use log::{info, error, warn};
 
-const TTL: Duration = Duration::from_secs(1);
-const METADATA_BLOCKS: u32 = 2;
+// 256 blocks * 4KB = 1MB Reserved Metadata
+const METADATA_BLOCKS: u32 = 256;
 const SUPERBLOCK_ID: u32 = 0;
+#[allow(dead_code)]
+const TTL: Duration = Duration::from_secs(1);
 
-// --- Internal Types (Decoupled from FUSE) ---
+// --- Internal Types ---
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum MirageFileType {
@@ -30,7 +33,6 @@ pub enum MirageFileType {
 }
 
 /// Serializable File Attribute representation.
-/// We use this to persist inode attributes to the encrypted disk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SerializedFileAttr {
     pub ino: u64,
@@ -53,7 +55,6 @@ pub struct Inode {
 }
 
 /// The Superblock contains the entire filesystem state.
-/// This is serialized, compressed, and encrypted into Block 0 and 1.
 #[derive(Serialize, Deserialize)]
 struct Superblock {
     inodes: HashMap<u64, Inode>,
@@ -92,10 +93,11 @@ impl std::fmt::Debug for MirageFS {
 impl MirageFS {
     pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32) -> anyhow::Result<Self> {
         // Attempt to load existing filesystem
+        info!("Attempting to load filesystem metadata...");
         let load_result = Self::load_metadata(&disk);
 
         if let Ok(sb) = load_result {
-            println!("Superblock Loaded! {} inodes found.", sb.inodes.len());
+            info!("Superblock Loaded! {} inodes found.", sb.inodes.len());
 
             if !format {
                 let mut fs = MirageFS {
@@ -112,15 +114,22 @@ impl MirageFS {
                     inode.attr.gid = gid;
                 }
                 return Ok(fs);
+            } else {
+                warn!("Format requested. Overwriting existing filesystem.");
             }
+        } else if !format {
+            let err = load_result.err().unwrap();
+            error!("Failed to load metadata: {}", err);
+            anyhow::bail!("Could not load MirageFS metadata. Use --format if this is a new volume. Error: {}", err);
         }
 
         // Initialize empty filesystem
+        info!("Initializing NEW filesystem...");
         let mut fs = MirageFS {
             disk,
             inodes: HashMap::new(), directory_map: HashMap::new(),
             next_inode: 2,
-            disk_size_blocks: METADATA_BLOCKS,
+            disk_size_blocks: METADATA_BLOCKS, // Reserve space for metadata
             block_owner: HashMap::new(),
             uid, gid
         };
@@ -150,7 +159,6 @@ impl MirageFS {
     }
 
     /// Resolves a full path string (e.g., "/foo/bar") to an Inode.
-    /// Essential for WebDAV which speaks in paths, not inodes.
     pub fn resolve_path(&self, path: &Path) -> Result<u64, i32> {
         let mut current_ino = 1; // Start at Root
         for component in path.components() {
@@ -172,6 +180,24 @@ impl MirageFS {
             }
         }
         Ok(current_ino)
+    }
+
+    pub fn set_attr_internal(&mut self, ino: u64, size: Option<u64>, mtime: Option<u64>, mode: Option<u16>) -> Result<(), i32> {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            if let Some(s) = size {
+                inode.attr.size = s;
+            }
+            if let Some(t) = mtime {
+                inode.attr.mtime_secs = t;
+            }
+            if let Some(m) = mode {
+                inode.attr.perm = m;
+            }
+            let _ = self.sync_disk();
+            Ok(())
+        } else {
+            Err(ENOENT)
+        }
     }
 
     pub fn create_file_internal(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
@@ -322,74 +348,94 @@ impl MirageFS {
     }
 
     pub fn write_data_internal(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, i32> {
-        if let Some(inode) = self.inodes.get_mut(&ino) {
-            let mut total_written: usize = 0;
-            let mut current_offset = offset as usize;
+        let mut total_written: usize = 0;
+        let mut current_offset = offset as usize;
 
-            while total_written < data.len() {
-                let relative_block = current_offset / BLOCK_SIZE;
-                let block_offset = current_offset % BLOCK_SIZE;
+        let mut blocks = if let Some(inode) = self.inodes.get(&ino) {
+            inode.blocks.clone()
+        } else {
+            return Err(ENOENT);
+        };
 
-                // Allocate new blocks if needed
-                while inode.blocks.len() <= relative_block {
-                    let new_block_idx = self.disk_size_blocks;
-                    self.disk_size_blocks += 1;
-                    inode.blocks.push(new_block_idx);
-                    self.block_owner.insert(new_block_idx, ino);
-                }
+        while total_written < data.len() {
+            let relative_block = current_offset / BLOCK_SIZE;
+            let block_offset = current_offset % BLOCK_SIZE;
 
-                let abs_block_idx = inode.blocks[relative_block];
-                let remaining_data = data.len() - total_written;
-                let space_in_block = BLOCK_SIZE - block_offset;
-                let chunk_size = std::cmp::min(remaining_data, space_in_block);
-
-                // Read-Modify-Write cycle for partial block writes
-                let mut block_data = if block_offset == 0 && chunk_size == BLOCK_SIZE {
-                    [0u8; BLOCK_SIZE] // Optimization: Full block overwrite
-                } else {
-                    match self.disk.read_block(abs_block_idx) {
-                        Ok(data) => data,
-                        Err(_) => [0u8; BLOCK_SIZE],
-                    }
-                };
-
-                let chunk_data = &data[total_written..total_written + chunk_size];
-                block_data[block_offset..block_offset + chunk_size].copy_from_slice(chunk_data);
-
-                if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) {
-                    if total_written > 0 { break; }
-                    return Err(EIO);
-                }
-
-                total_written += chunk_size;
-                current_offset += chunk_size;
+            // Allocate new blocks if needed
+            while blocks.len() <= relative_block {
+                let new_block_idx = self.disk_size_blocks;
+                self.disk_size_blocks += 1;
+                blocks.push(new_block_idx);
+                self.block_owner.insert(new_block_idx, ino);
             }
 
+            let abs_block_idx = blocks[relative_block];
+            let remaining_data = data.len() - total_written;
+            let space_in_block = BLOCK_SIZE - block_offset;
+            let chunk_size = std::cmp::min(remaining_data, space_in_block);
+
+            // Read-Modify-Write cycle for partial block writes
+            let mut block_data = if block_offset == 0 && chunk_size == BLOCK_SIZE {
+                [0u8; BLOCK_SIZE] // Optimization: Full block overwrite
+            } else {
+                match self.disk.read_block(abs_block_idx) {
+                    Ok(data) => data,
+                    Err(_) => [0u8; BLOCK_SIZE],
+                }
+            };
+
+            let chunk_data = &data[total_written..total_written + chunk_size];
+            block_data[block_offset..block_offset + chunk_size].copy_from_slice(chunk_data);
+
+            if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) {
+                if total_written > 0 { break; }
+                return Err(EIO);
+            }
+
+            total_written += chunk_size;
+            current_offset += chunk_size;
+        }
+
+        // Update Inode metadata
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.blocks = blocks;
             let end_pos = (offset as u64) + (total_written as u64);
             if end_pos > inode.attr.size { inode.attr.size = end_pos; }
             inode.attr.blocks = inode.blocks.len() as u64;
-
-            Ok(total_written)
-        } else {
-            Err(ENOENT)
+            // Update mtime
+            inode.attr.mtime_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         }
+
+        // Auto-sync for stability
+        let _ = self.save_metadata();
+
+        Ok(total_written)
     }
 
     fn load_metadata(disk: &Box<dyn BlockDevice>) -> anyhow::Result<Superblock> {
         let mut raw_data = Vec::new();
-        for i in 0..METADATA_BLOCKS {
+        // Check first block specifically for emptiness to fail fast
+        let first = disk.read_block(SUPERBLOCK_ID).map_err(|e| anyhow::anyhow!(e))?;
+        if first.iter().all(|&x| x == 0) {
+            return Err(anyhow::anyhow!("Block 0 is empty (No filesystem found)"));
+        }
+        raw_data.extend_from_slice(&first);
+
+        for i in 1..METADATA_BLOCKS {
             let block = disk.read_block(SUPERBLOCK_ID + i).map_err(|e| anyhow::anyhow!(e))?;
             raw_data.extend_from_slice(&block);
         }
-        if raw_data.iter().all(|&x| x == 0) { return Err(anyhow::anyhow!("Empty")); }
 
         let mut decoder = ZlibDecoder::new(&raw_data[..]);
         let mut decompressed_data = Vec::new();
         if std::io::Read::read_to_end(&mut decoder, &mut decompressed_data).is_err() {
-            return Err(anyhow::anyhow!("Decompression failed"));
+            return Err(anyhow::anyhow!("Decompression failed - Metadata Corrupt"));
         }
-        let sb: Superblock = bincode::deserialize(&decompressed_data)?;
-        Ok(sb)
+
+        match bincode::deserialize::<Superblock>(&decompressed_data) {
+            Ok(sb) => Ok(sb),
+            Err(e) => Err(anyhow::anyhow!("Deserialization failed: {}", e))
+        }
     }
 
     pub fn save_metadata(&mut self) -> anyhow::Result<()> {
@@ -401,19 +447,31 @@ impl MirageFS {
         };
 
         let data = bincode::serialize(&sb)?;
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&data)?;
         let compressed_data = encoder.finish()?;
 
+        // Check if metadata fits
+        if compressed_data.len() > (METADATA_BLOCKS as usize * BLOCK_SIZE) {
+            error!("CRITICAL: Metadata size ({}) exceeds reserved blocks!", compressed_data.len());
+            // In a real FS, we'd allocate dynamic metadata blocks.
+            // For now, warn but try to write what we can or fail.
+        }
+
         let chunks = compressed_data.chunks(BLOCK_SIZE);
         let mut blocks_written = 0;
+
         for (i, chunk) in chunks.enumerate() {
+            if i >= METADATA_BLOCKS as usize { break; }
             let mut block = [0u8; BLOCK_SIZE];
             block[0..chunk.len()].copy_from_slice(chunk);
             self.disk.write_block(SUPERBLOCK_ID + i as u32, &block).map_err(|e| anyhow::anyhow!(e))?;
             blocks_written += 1;
         }
 
+        // Zero out remaining metadata blocks to clean up old state
+        // Optimize: Only zero out a few subsequent blocks to save IO, or assume overwrite.
+        // For safety/security we zero out the rest to avoid leaking old structure
         let zero_block = [0u8; BLOCK_SIZE];
         for i in blocks_written..METADATA_BLOCKS as usize {
             self.disk.write_block(SUPERBLOCK_ID + i as u32, &zero_block).map_err(|e| anyhow::anyhow!(e))?;
@@ -474,9 +532,18 @@ impl MirageFS {
     }
 
     pub fn sync_disk(&mut self) -> i32 {
-        if let Err(_) = self.disk.resize(self.disk_size_blocks as u64) { return EIO; }
-        if let Err(_) = self.save_metadata() { return EIO; }
-        if let Err(_) = self.disk.sync() { return EIO; }
+        if let Err(e) = self.disk.resize(self.disk_size_blocks as u64) {
+            error!("Resize failed: {}", e);
+            return EIO;
+        }
+        if let Err(e) = self.save_metadata() {
+            error!("Metadata save failed: {}", e);
+            return EIO;
+        }
+        if let Err(e) = self.disk.sync() {
+            error!("Disk sync failed: {}", e);
+            return EIO;
+        }
         0
     }
 }

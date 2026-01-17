@@ -1,10 +1,9 @@
 // src/main.rs
 use clap::{Parser, ArgAction};
-use log::{info, error, warn, LevelFilter};
+use log::{info, error, LevelFilter};
 use std::path::PathBuf;
 use std::io::{self, Write};
 use env_logger::Builder;
-use std::process::Command;
 #[cfg(feature = "fuse")]
 use fuser::MountOption;
 #[cfg(feature = "fuse")]
