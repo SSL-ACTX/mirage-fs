@@ -7,7 +7,7 @@ use fuser::{
 };
 #[cfg(feature = "fuse")]
 use std::ffi::OsStr;
-use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY};
+use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY, EACCES};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

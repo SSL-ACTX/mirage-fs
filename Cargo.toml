@@ -33,6 +33,7 @@ hyper = "1.8.1"
 bytes = "1.11.0"
 futures = "0.3.31"
 hyper-util = { version = "0.1.19", features = ["tokio", "server", "server-auto", "http1"] }
+http-body-util = "0.1.3"
 
 [profile.dev]
 strip = true

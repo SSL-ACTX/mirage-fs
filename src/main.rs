@@ -1,8 +1,9 @@
 // src/main.rs
 use clap::{Parser, ArgAction};
-use log::{info, error, LevelFilter};
+use log::{info, error, warn, LevelFilter};
 use std::path::PathBuf;
 use std::io::{self, Write};
+use std::process::Command;
 use env_logger::Builder;
 #[cfg(feature = "fuse")]
 use fuser::MountOption;
@@ -17,6 +18,7 @@ mod jpeg_disk;
 mod webp_disk;
 mod mp4_disk;
 mod webdav_server;
+mod web_assets;
 
 use block_device::BlockDevice;
 use raid_device::Raid0Device;

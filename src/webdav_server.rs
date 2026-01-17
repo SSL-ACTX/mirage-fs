@@ -1,9 +1,13 @@
 // src/webdav_server.rs
 use crate::mirage_fs::{MirageFS, MirageFileType};
+#[path = "web_assets.rs"]
+mod web_assets;
+
 use dav_server::{
     fs::{DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, OpenOptions},
     davpath::DavPath,
     DavHandler,
+    body::Body,
 };
 use std::sync::{Arc, Mutex};
 use std::io::SeekFrom;
@@ -12,6 +16,7 @@ use std::time::SystemTime;
 use futures::FutureExt;
 use bytes::{Bytes, Buf};
 use dav_server::fakels::FakeLs;
+use hyper::{Method, StatusCode};
 
 // --- Error Mapping Helper ---
 fn map_err(code: i32) -> FsError {
@@ -461,7 +466,8 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("🌐 WebDAV Server running at http://{}/", addr);
-    println!("   -> Connect to http://127.0.0.1:{}", port);
+    println!("   -> Connect via Browser for UI: http://127.0.0.1:{}", port);
+    println!("   -> Connect via WebDAV Client:  http://127.0.0.1:{}", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
@@ -474,6 +480,15 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
             let service = hyper::service::service_fn(move |req| {
                 let dav_server = dav_server.clone();
                 async move {
+                    // Simple Route: If GET /, serve HTML UI. Else, WebDAV.
+                    if req.method() == Method::GET && req.uri().path() == "/" {
+                        return Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                            .header("Content-Type", "text/html")
+                            .body(Body::from(Bytes::from(web_assets::HTML)))
+                            .unwrap()
+                        );
+                    }
                     Ok::<_, std::convert::Infallible>(dav_server.handle(req).await)
                 }
             });
