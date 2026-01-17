@@ -31,7 +31,7 @@ use mp4_disk::Mp4Disk;
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
-#[command(version = "1.3.0")]
+#[command(version = "1.4.0")]
 #[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files.")]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
