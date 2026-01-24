@@ -24,7 +24,7 @@ Unlike traditional steganography tools that simply hide a static payload, Mirage
 
 ## 🚀 Key Features
 
-### 🛡️ Military-Grade Encryption
+### 🛡️ Strong Encryption
 Your data is secured with state-of-the-art authenticated encryption.
 * **Cipher:** **XChaCha20-Poly1305** (Extended Nonce + MAC authentication).
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
