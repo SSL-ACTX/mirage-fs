@@ -135,6 +135,24 @@ mirage /tmp/secret cover.png movie.mp4
 
 ```
 
+### 2️⃣.1 Remote Media URLs (Read-Only)
+
+You can mount a **remote** carrier by passing an `http://` or `https://` URL. URL media is **read-only** and runs in WebDAV mode if FUSE is unavailable.
+
+```bash
+# Read-only mount from a remote image URL
+mirage /tmp/secret https://example.com/secret.jpeg
+
+# Read-only mount from a remote MP4 URL (streamed via HTTP range requests)
+mirage /tmp/secret https://example.com/secret.mp4
+```
+
+**Notes:**
+* Remote **images** are downloaded to a temporary cache (read-only). Remote **MP4/MOV** files are streamed using byte-range reads.
+* `--format` is **not** allowed with URL media.
+* You can set a safety cap for remote downloads with `MIRAGE_URL_MAX_BYTES` (default: 2 GiB).
+* You can increase read-ahead for MP4 URL streaming with `MIRAGE_URL_READAHEAD` (bytes, default: 524288).
+
 ### 3️⃣ Web UI (Browser Access)
 
 You can access the new graphical interface by opening the server address in any web browser.

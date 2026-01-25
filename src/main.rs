@@ -18,7 +18,7 @@ mod jpeg_disk;
 mod webp_disk;
 mod mp4_disk;
 mod webdav_server;
-mod web_assets;
+mod url_media;
 
 use block_device::BlockDevice;
 use raid_device::Raid0Device;
@@ -27,6 +27,7 @@ use png_disk::PngDisk;
 use jpeg_disk::JpegDisk;
 use webp_disk::WebPDisk;
 use mp4_disk::Mp4Disk;
+use url_media::{open_media_url, is_url};
 
 #[derive(Parser)]
 #[command(name = "MirageFS")]
@@ -37,7 +38,7 @@ struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
     mount_point: PathBuf,
     #[arg(value_name = "MEDIA_FILES", required = true, num_args = 1..)]
-    image_files: Vec<PathBuf>,
+    image_files: Vec<String>,
     #[arg(short, long)]
     format: bool,
     #[arg(short, long, action = ArgAction::Count)]
@@ -93,10 +94,13 @@ fn main() -> anyhow::Result<()> {
 
     // --- Pre-Flight Checks ---
 
-    // Verify Media Files Exist
-    for path in &cli.image_files {
-        if !path.exists() {
-            anyhow::bail!("Media file not found: {:?}", path);
+    // Verify Media Files Exist (Local Paths Only)
+    for source in &cli.image_files {
+        if !is_url(source) {
+            let path = PathBuf::from(source);
+            if !path.exists() {
+                anyhow::bail!("Media file not found: {:?}", path);
+            }
         }
     }
 
@@ -128,13 +132,26 @@ fn main() -> anyhow::Result<()> {
 
     // --- Initialize Storage Layer ---
     let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
+    let mut read_only = false;
     info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
 
-    for path in cli.image_files {
+    for source in cli.image_files {
+        if is_url(&source) {
+            if cli.format {
+                anyhow::bail!("Formatting is not supported for media URLs (read-only mode). Remove --format.");
+            }
+            info!("Loading remote carrier: {}", source);
+            let disk = open_media_url(&source, &password)?;
+            disks.push(disk);
+            read_only = true;
+            continue;
+        }
+
+        let path = PathBuf::from(&source);
         let extension = path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
+            .and_then(|ext| ext.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
 
         info!("Loading carrier: {:?}", path);
 
@@ -156,7 +173,7 @@ fn main() -> anyhow::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let fs = match MirageFS::new(Box::new(raid_controller), cli.format, uid, gid) {
+    let fs = match MirageFS::new(Box::new(raid_controller), cli.format, uid, gid, read_only) {
         Ok(fs) => fs,
         Err(e) => {
             error!("Filesystem Init Error: {}", e);
@@ -172,7 +189,7 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "fuse")]
     {
-        run_fuse(fs, cli.mount_point)
+        run_fuse(fs, cli.mount_point, read_only)
     }
 
     #[cfg(not(feature = "fuse"))]
@@ -196,14 +213,19 @@ fn run_webdav(fs: MirageFS, port: u16) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "fuse")]
-fn run_fuse(fs: MirageFS, mount_point: PathBuf) -> anyhow::Result<()> {
-    let options = vec![
-        MountOption::RW,
+fn run_fuse(fs: MirageFS, mount_point: PathBuf, read_only: bool) -> anyhow::Result<()> {
+    let mut options = vec![
         MountOption::FSName("mirage".to_string()),
         MountOption::AutoUnmount,
         MountOption::AllowOther,
         MountOption::DefaultPermissions,
     ];
+
+    if read_only {
+        options.push(MountOption::RO);
+    } else {
+        options.push(MountOption::RW);
+    }
 
     info!("Mounting at {:?}", mount_point);
     let uid = unsafe { libc::getuid() };

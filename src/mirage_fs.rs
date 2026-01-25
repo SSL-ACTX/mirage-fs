@@ -79,6 +79,7 @@ pub struct MirageFS {
     block_owner: HashMap<u32, u64>,
     uid: u32,
     gid: u32,
+    read_only: bool,
 }
 
 impl std::fmt::Debug for MirageFS {
@@ -91,7 +92,10 @@ impl std::fmt::Debug for MirageFS {
 }
 
 impl MirageFS {
-    pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32) -> anyhow::Result<Self> {
+    pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32, read_only: bool) -> anyhow::Result<Self> {
+        if read_only && format {
+            anyhow::bail!("Read-only media cannot be formatted.");
+        }
         // Attempt to load existing filesystem
         info!("Attempting to load filesystem metadata...");
         let load_result = Self::load_metadata(&disk);
@@ -106,7 +110,8 @@ impl MirageFS {
                     next_inode: sb.next_inode,
                     disk_size_blocks: sb.disk_size_blocks,
                     block_owner: sb.block_owner,
-                    uid, gid
+                    uid, gid,
+                    read_only,
                 };
                 // Fix permissions for current user context (ownership override)
                 for inode in fs.inodes.values_mut() {
@@ -131,7 +136,8 @@ impl MirageFS {
             next_inode: 2,
             disk_size_blocks: METADATA_BLOCKS, // Reserve space for metadata
             block_owner: HashMap::new(),
-            uid, gid
+            uid, gid,
+            read_only,
         };
 
         // Create Root Directory (Inode 1)
@@ -183,6 +189,7 @@ impl MirageFS {
     }
 
     pub fn set_attr_internal(&mut self, ino: u64, size: Option<u64>, mtime: Option<u64>, mode: Option<u16>) -> Result<(), i32> {
+        if self.read_only { return Err(EACCES); }
         if let Some(inode) = self.inodes.get_mut(&ino) {
             if let Some(s) = size {
                 inode.attr.size = s;
@@ -201,6 +208,7 @@ impl MirageFS {
     }
 
     pub fn create_file_internal(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
+        if self.read_only { return Err(EACCES); }
         let new_ino = self.allocate_inode(MirageFileType::RegularFile, 0o644);
         self.directory_map.entry(parent).or_default().insert(name.to_string(), new_ino);
         let _ = self.sync_disk();
@@ -208,6 +216,7 @@ impl MirageFS {
     }
 
     pub fn mkdir_internal(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
+        if self.read_only { return Err(EACCES); }
         if let Some(children) = self.directory_map.get(&parent) {
             if children.contains_key(name) {
                 return Err(EEXIST);
@@ -222,6 +231,7 @@ impl MirageFS {
     }
 
     pub fn unlink_internal(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        if self.read_only { return Err(EACCES); }
         let ino_to_remove = if let Some(children) = self.directory_map.get_mut(&parent) {
             children.remove(name)
         } else {
@@ -240,6 +250,7 @@ impl MirageFS {
 
     // Safe directory removal: Checks if directory is empty first.
     pub fn rmdir_internal(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        if self.read_only { return Err(EACCES); }
         if let Some(children) = self.directory_map.get(&parent) {
             if let Some(&ino) = children.get(name) {
                 if let Some(grandkids) = self.directory_map.get(&ino) {
@@ -254,6 +265,7 @@ impl MirageFS {
 
     // Atomic Rename / Move logic
     pub fn rename_internal(&mut self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
+        if self.read_only { return Err(EACCES); }
         let name_str = name.to_string();
         let newname_str = newname.to_string();
 
@@ -348,6 +360,7 @@ impl MirageFS {
     }
 
     pub fn write_data_internal(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, i32> {
+        if self.read_only { return Err(EACCES); }
         let mut total_written: usize = 0;
         let mut current_offset = offset as usize;
 
@@ -528,6 +541,9 @@ impl MirageFS {
     }
 
     pub fn sync_disk(&mut self) -> i32 {
+        if self.read_only {
+            return 0;
+        }
         if let Err(e) = self.disk.resize(self.disk_size_blocks as u64) {
             error!("Resize failed: {}", e);
             return EIO;

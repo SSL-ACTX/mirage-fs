@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use futures::FutureExt;
 use bytes::{Bytes, Buf};
 use dav_server::fakels::FakeLs;
-use hyper::{Method, StatusCode};
+use hyper::Method;
 
 // --- Error Mapping Helper ---
 fn map_err(code: i32) -> FsError {
