@@ -16,45 +16,47 @@
 
 ---
 
-## 📖 Overview
+## Overview
 
 **MirageFS** is a high-stealth steganographic filesystem built in Rust. It allows you to format and mount standard media files (`.png`, `.jpg`, `.webp`, `.mp4`, `.mov`) as fully functional read/write drives.
 
 Unlike traditional steganography tools that simply hide a static payload, MirageFS implements a **virtual block device** inside the media. This means you can interact with your hidden files in real-time using your OS's native file explorer (`cp`, `mv`, `vim`, `mkdir`, `rmdir`, etc.) without extracting them first.
 
-## 🚀 Key Features
+## Key Features
 
-### 🛡️ Strong Encryption
+### Strong Encryption
 Your data is secured with state-of-the-art authenticated encryption.
 * **Cipher:** **XChaCha20-Poly1305** (Extended Nonce + MAC authentication).
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
 
-### 🖥️ Embedded Web Interface (New!)
+### Embedded Web Interface
 MirageFS now ships with a stunning, self-hosted **Web Management UI** served directly from the binary.
 * **Visual File Manager:** Navigate folders, view file details, and manage storage with a modern web UI.
 * **Drag & Drop Upload:** Encrypt files instantly by dragging them into the browser window.
 * **Zero Client Setup:** Works on any device with a web browser (Mobile/Desktop) without installing WebDAV clients.
 
-### 🕒 Timestamp Freeze (Anti-Forensics)
-MirageFS now **freezes all filesystem timestamps** (mtime/atime/ctime) to a fixed value so filesystem activity never updates visible times.
-* **FUSE + WebDAV:** All file metadata reports a fixed time.
-* **Carrier Files:** Media timestamps are restored after access and writes.
-* **Note:** On Linux, kernel `ctime` cannot be user-set; MirageFS avoids touching it by restoring carrier times after IO.
-
-### 🌐 Universal Driverless Access
+### Universal Driverless Access
 MirageFS includes an embedded **WebDAV Server**.
 * **No Drivers Required:** Works on restricted systems (corporate laptops, public computers) where you cannot install FUSE or kernel drivers.
 * **Network Capable:** Mount your hidden drive over the LAN or VPN.
 * **Cross-Platform:** Native integration with Windows Explorer, macOS Finder, iOS, and Android.
 
-### ⛓️ Hybrid "Smart" RAID Controller
+### Timestamp Freeze
+MirageFS freezes filesystem timestamps to a fixed value to avoid revealing activity.
+* **FUSE + WebDAV:** Report a fixed timestamp for files and directories.
+* **Carrier Files:** Original atime/mtime are restored after access and writes.
+
+> [!NOTE]
+> Linux `ctime` cannot be user-set; MirageFS minimizes updates by restoring carrier timestamps after IO.
+
+### Hybrid "Smart" RAID Controller
 MirageFS introduces a sophisticated **Tiered RAID 0** system that automatically balances stealth and capacity.
 * **Zone 1 (High Stealth):** Stripes data across **ALL** devices (e.g., Image + Video). This maximizes entropy dilution, making the payload harder to detect forensically.
 * **Zone 2 (Overflow):** Once static carriers (like PNGs) are full, the controller seamlessly transitions to **Overflow Mode**, writing remaining data exclusively to expandable carriers (MP4s).
 * **Result:** You get the forensic safety of striping *plus* the massive capacity of video files in a single logical volume.
 
-### 🥷 Advanced Steganography
+### Advanced Steganography
 MirageFS employs distinct, format-optimized strategies to defeat forensic analysis.
 
 | Media Format | Strategy | Stealth Technique |
@@ -64,16 +66,15 @@ MirageFS employs distinct, format-optimized strategies to defeat forensic analys
 | **JPEG** | **DNG Morphing** | Data is injected into `APP1` segments mimicking valid **Adobe DNG Private Data** (Tag `0xC634`) inside a standard TIFF structure. |
 | **WebP** | **RIFF Morphing** | Similar to JPEG, data is disguised as vendor-specific metadata inside the `EXIF` chunk of the RIFF container. |
 
-### 📂 Full Filesystem Semantics
+### Full Filesystem Semantics
 MirageFS is not just a key-value store; it is a compliant POSIX-like filesystem.
 * **Directory Support:** Create nested folders (`mkdir`), remove them (`rmdir`), and organize your data hierarchy.
 * **Atomic Renames:** Move and rename files/folders instantly (`mv`).
 * **Auto-Shrink:** Deleting files triggers a "swap-and-pop" compaction. The MP4 container physically shrinks on disk to reflect the deleted data, leaving no "slack space" evidence.
-* **Compact Metadata:** Metadata blocks grow dynamically and no longer cause large size jumps for small carriers.
 
 ---
 
-## 📦 Installation
+## Installation
 
 MirageFS supports two modes: **Native FUSE** (High Performance) and **WebDAV** (High Compatibility).
 
@@ -111,9 +112,9 @@ sudo cp target/release/mirage /usr/local/bin/mirage
 
 ---
 
-## 🎮 Usage
+## Usage
 
-### 1️⃣ Formatting (Destructive)
+### 1. Formatting (Destructive)
 
 Create a new secret drive inside a carrier image or video (or a combination).
 
@@ -132,7 +133,7 @@ mirage /tmp/secret cover.png movie.mp4 --format
 
 ```
 
-### 2️⃣ Mounting (Smart Detect)
+### 2. Mounting (Smart Detect)
 
 Run the command normally. MirageFS will attempt to mount via FUSE. If FUSE is unavailable (e.g., on Windows or restricted Linux), it will **automatically** start the WebDAV server.
 
@@ -148,7 +149,7 @@ You can also force a local mount to be read-only:
 mirage /tmp/secret cover.png --read-only
 ```
 
-### 2️⃣.1 Remote Media URLs (Read-Only)
+### 2.1 Remote Media URLs (Read-Only)
 
 You can mount a **remote** carrier by passing an `http://` or `https://` URL. URL media is **read-only** and runs in WebDAV mode if FUSE is unavailable.
 
@@ -169,7 +170,7 @@ mirage /tmp/secret https://example.com/secret.mp4
 * Async cache writes: set `MIRAGE_URL_WRITEBACK=1`.
 * Prefetch next range: set `MIRAGE_URL_PREFETCH=1` (disabled by default).
 
-### 3️⃣ Web UI (Browser Access)
+### 3. Web UI (Browser Access)
 
 You can access the new graphical interface by opening the server address in any web browser.
 
@@ -179,7 +180,7 @@ You can access the new graphical interface by opening the server address in any 
 * **Manage:** Create folders, delete items, and browse your hidden filesystem.
 * **Metrics:** `http://127.0.0.1:8080/__metrics`
 
-### 4️⃣ WebDAV Mode (Manual / Network Share)
+### 4. WebDAV Mode (Manual / Network Share)
 
 You can force WebDAV mode (bypassing FUSE) to mount the drive as a Network Share. This is useful for systems without FUSE drivers.
 
@@ -200,7 +201,7 @@ mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
 > [!NOTE]
 > Visiting the root URL (`http://127.0.0.1:8080`) in a browser loads the **Web UI**. To mount the filesystem as a native drive in your OS, you must use the "Connect to Server" / "Map Network Drive" feature of your file manager, not a web browser.
 
-### 5️⃣ Unmounting
+### 5. Unmounting
 
 To close the drive and flush all data:
 
@@ -209,9 +210,9 @@ To close the drive and flush all data:
 
 ---
 
-## 🔧 Technical Deep Dive
+## Technical Deep Dive
 
-### ⬛ MP4 "Shadow Injection" Engine
+### MP4 "Shadow Injection" Engine
 
 MirageFS exploits the atom structure of ISO Base Media Files (MP4/MOV).
 Standard players read the `moov` (Movie) atom to find the location of video frames in the `mdat` (Media Data) atom.
@@ -220,14 +221,14 @@ Standard players read the `moov` (Movie) atom to find the location of video fram
 2. **Camouflage:** Raw encrypted data looks like random noise (high entropy), which is suspicious. We wrap every encrypted block in **H.264 NAL Unit headers** (specifically `Type 12: Filler Data`).
 3. **Result:** To a forensic tool or packet inspector, the hidden data appears to be valid video stream padding/bitrate filler.
 
-### 🟦 The PNG "Feistel" Engine
+### The PNG "Feistel" Engine
 
 MirageFS treats the PNG pixels as a domain of size . A custom **Feistel Network** creates a bijective (1-to-1) permutation between the *Logical Block Address* and the *Physical Pixel Index*.
 
 * **Zero Memory Overhead:** No mapping table is stored. Locations are calculated mathematically on the fly.
 * **Collision Avoidance:** The engine smartly skips "Salt" pixels during the permutation step to ensure the RAID header is never overwritten.
 
-### 🟥 Hybrid RAID: Tiered Striping
+### Hybrid RAID: Tiered Striping
 
 When mixing static carriers (PNG/JPG) with dynamic carriers (MP4), a standard RAID 0 would be limited by the smallest drive. MirageFS uses a **Tiered Controller**:
 
@@ -235,7 +236,7 @@ When mixing static carriers (PNG/JPG) with dynamic carriers (MP4), a standard RA
 * **Zone 2:** When the PNG fills up (reaching the "Symmetric Stripe Limit"), the controller automatically detects the MP4 is expandable. It continues writing data to the MP4 only.
 * **Read/Write Logic:** The controller calculates `Logical_Index % Device_Count` for Zone 1 addresses, and transparently re-maps higher addresses to the remaining dynamic devices.
 
-### 🟧 The JPEG/WebP "Morphing" Engine
+### The JPEG/WebP "Morphing" Engine
 
 Compressed formats like JPEG destroy LSB data. MirageFS exploits the metadata layer instead.
 
@@ -243,22 +244,17 @@ Compressed formats like JPEG destroy LSB data. MirageFS exploits the metadata la
 2. **Camouflage:** Data is wrapped in valid **TIFF headers** and labeled as `DNGPrivateData` (Tag `0xC634`).
 3. **Result:** Forensic tools ignore the data, identifying it as "proprietary Adobe metadata" rather than a suspicious payload.
 
-### 🧪 Regression Tests
-MirageFS includes unit tests to prevent:
-* JPEG carrier bloat when formatting or writing data.
-* Timestamp drift after filesystem operations.
-
 ---
 
-## 🖥️ Platform Notes
+## Platform Notes
 
 <details>
-<summary><strong>🐧 Linux (Native)</strong></summary>
+<summary><strong>Linux (Native)</strong></summary>
 Works out of the box with standard FUSE installation.
 </details>
 
 <details>
-<summary><strong>🪟 Windows (WSL2 / Native)</strong></summary>
+<summary><strong>Windows (WSL2 / Native)</strong></summary>
 MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 1. Run MirageFS: `mirage.exe X: video.mp4 --webdav`
@@ -271,7 +267,7 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 </details>
 
 <details>
-<summary><strong>🍎 macOS</strong></summary>
+<summary><strong>macOS</strong></summary>
 
 * **Preferred:** Use WebDAV mode (`Cmd+K` -> `http://127.0.0.1:8080`) for zero-configuration access.
 * **FUSE:** Requires <a href="https://macfuse.github.io/">macFUSE</a> and manual approval of kernel extensions in System Settings.
@@ -280,7 +276,7 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 ---
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 > [!IMPORTANT]
 > **For Educational and Research Use Only.**
@@ -296,6 +292,6 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 **Author:** Seuriin ([SSL-ACTX](https://github.com/SSL-ACTX))
 
-*v1.4.0*
+*v1.5.0*
 
 </div>
