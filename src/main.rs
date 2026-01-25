@@ -32,7 +32,7 @@ use url_media::{open_media_url, is_url};
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
-#[command(version = "1.4.0")]
+#[command(version = "1.5.0")]
 #[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files.")]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
@@ -47,6 +47,8 @@ struct Cli {
     webdav: bool,
     #[arg(long, default_value = "8080", help = "Port for WebDAV server")]
     port: u16,
+    #[arg(long, help = "Mount as read-only (also implied for URL media)")]
+    read_only: bool,
 }
 
 fn print_banner() {
@@ -55,7 +57,7 @@ fn print_banner() {
     ██ ▀▀ ██ ██ ██▄█▄ ██▀██ ██ ▄▄ ██▄▄  ██▄▄   ▀▀▀▄▄▄
     ██    ██ ██ ██ ██ ██▀██ ▀███▀ ██▄▄▄ ██     █████▀
 
-    v1.3.0 | By Seuriin (SSL-ACTX)
+    v1.5.0 | By Seuriin (SSL-ACTX)
     "#);
 }
 
@@ -132,7 +134,7 @@ fn main() -> anyhow::Result<()> {
 
     // --- Initialize Storage Layer ---
     let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
-    let mut read_only = false;
+    let mut read_only = cli.read_only;
     info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
 
     for source in cli.image_files {
@@ -154,6 +156,10 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "unknown".to_string());
 
         info!("Loading carrier: {:?}", path);
+
+        if read_only && cli.format {
+            anyhow::bail!("--read-only cannot be used with --format.");
+        }
 
         let disk: Box<dyn BlockDevice> = match extension.as_str() {
             "png" => Box::new(PngDisk::new(path, &password, cli.format)?),

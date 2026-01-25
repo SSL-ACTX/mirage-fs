@@ -3,9 +3,13 @@ use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use crate::png_disk::PngDisk;
 use crate::jpeg_disk::JpegDisk;
 use crate::webp_disk::WebPDisk;
-use std::collections::HashSet;
+use crate::mp4_disk::Mp4Disk;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Error, ErrorKind, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use std::time::Duration;
 use log::{info, warn, debug};
 use reqwest::blocking::Client;
@@ -35,6 +39,7 @@ const SALT_SIZE: usize = 16;
 const MIRAGE_MAGIC: &[u8; 8] = b"MRG_AVC1";
 const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DEFAULT_READAHEAD_BYTES: usize = 512 * 1024; // 512 KiB
+const DEFAULT_DISK_CACHE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
@@ -44,18 +49,88 @@ enum MediaKind {
     Mp4,
 }
 
+struct UrlMetrics {
+    bytes_read: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    range_requests: AtomicU64,
+    last_latency_ms: AtomicU64,
+}
+
+static URL_METRICS: OnceLock<UrlMetrics> = OnceLock::new();
+
+impl UrlMetrics {
+    fn get() -> &'static UrlMetrics {
+        URL_METRICS.get_or_init(|| UrlMetrics {
+            bytes_read: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            range_requests: AtomicU64::new(0),
+            last_latency_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn hit_cache(bytes: u64) {
+        let m = Self::get();
+        m.cache_hits.fetch_add(1, Ordering::Relaxed);
+        m.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn miss_cache(bytes: u64) {
+        let m = Self::get();
+        m.cache_misses.fetch_add(1, Ordering::Relaxed);
+        m.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn range_request(latency_ms: u64) {
+        let m = Self::get();
+        m.range_requests.fetch_add(1, Ordering::Relaxed);
+        m.last_latency_ms.store(latency_ms, Ordering::Relaxed);
+    }
+}
+
+pub fn url_metrics_json() -> String {
+    let m = UrlMetrics::get();
+    format!(
+        "{{\"bytes_read\":{},\"cache_hits\":{},\"cache_misses\":{},\"range_requests\":{},\"last_latency_ms\":{}}}",
+        m.bytes_read.load(Ordering::Relaxed),
+        m.cache_hits.load(Ordering::Relaxed),
+        m.cache_misses.load(Ordering::Relaxed),
+        m.range_requests.load(Ordering::Relaxed),
+        m.last_latency_ms.load(Ordering::Relaxed),
+    )
+}
+
 pub fn is_url(source: &str) -> bool {
-    source.starts_with("http://") || source.starts_with("https://")
+    source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("file://")
+        || source.starts_with("s3://")
 }
 
 pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn BlockDevice>> {
+    // file:// URLs map directly to local read-only carriers.
+    if let Ok(parsed) = Url::parse(url) {
+        if parsed.scheme() == "file" {
+            let path = parsed.to_file_path()
+                .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", url))?;
+            return open_local_readonly(path, password);
+        }
+    }
+
+    // s3://bucket/key -> https://bucket.s3.amazonaws.com/key (public or pre-signed)
+    let mut url = url.to_string();
+    if url.starts_with("s3://") {
+        url = s3_to_https(&url)?;
+    }
+
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(Policy::limited(10))
         .user_agent("MirageFS/1.4.0")
         .build()?;
 
-    let resolved_url = resolve_media_url(&client, url, 8)?;
+    let resolved_url = resolve_media_url(&client, &url, 8)?;
     let head_info = fetch_head_info(&client, &resolved_url);
     let kind = detect_media_kind(&head_info.final_url, head_info.content_type.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
@@ -160,6 +235,34 @@ fn detect_media_kind_from_url(url: &str) -> Option<MediaKind> {
         "mp4" | "m4v" | "mov" => Some(MediaKind::Mp4),
         _ => None,
     }
+}
+
+fn open_local_readonly(path: PathBuf, password: &str) -> anyhow::Result<Box<dyn BlockDevice>> {
+    let extension = path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let disk: Box<dyn BlockDevice> = match extension.as_str() {
+        "png" => Box::new(PngDisk::new(path, password, false)?),
+        "jpg" | "jpeg" => Box::new(JpegDisk::new(path, password, false)?),
+        "webp" => Box::new(WebPDisk::new(path, password, false)?),
+        "mp4" | "m4v" | "mov" => Box::new(Mp4Disk::new(path, password, false)?),
+        _ => anyhow::bail!("Unsupported file extension: .{}", extension),
+    };
+
+    Ok(Box::new(ReadOnlyDevice::new(disk, None)))
+}
+
+fn s3_to_https(url: &str) -> anyhow::Result<String> {
+    let stripped = url.trim_start_matches("s3://");
+    let mut parts = stripped.splitn(2, '/');
+    let bucket = parts.next().unwrap_or("");
+    let key = parts.next().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        anyhow::bail!("Invalid s3 URL: {}", url);
+    }
+    Ok(format!("https://{}.s3.amazonaws.com/{}", bucket, key))
 }
 
 fn download_to_file(client: &Client, url: &str, path: &Path) -> anyhow::Result<()> {
@@ -482,6 +585,37 @@ fn read_ahead_bytes() -> usize {
         .unwrap_or(DEFAULT_READAHEAD_BYTES)
 }
 
+fn writeback_enabled() -> bool {
+    std::env::var("MIRAGE_URL_WRITEBACK")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn prefetch_enabled() -> bool {
+    std::env::var("MIRAGE_URL_PREFETCH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    .unwrap_or(false)
+}
+
+fn disk_cache_max_bytes() -> u64 {
+    std::env::var("MIRAGE_URL_CACHE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_DISK_CACHE_BYTES)
+}
+
+fn init_disk_cache() -> Option<DiskCache> {
+    let dir = std::env::var("MIRAGE_URL_CACHE_DIR").ok()?;
+    let path = PathBuf::from(dir);
+    if std::fs::create_dir_all(&path).is_err() {
+        return None;
+    }
+    Some(DiskCache::new(path, disk_cache_max_bytes()))
+}
+
 fn try_curl_like_resolution(start: &str) -> anyhow::Result<Option<String>> {
     // Create a client that resembles curl and follows redirects aggressively.
     let client = Client::builder()
@@ -553,14 +687,93 @@ impl BlockDevice for ReadOnlyDevice {
 struct HttpRangeReader {
     client: Client,
     origin_url: String,
-    url: std::sync::Mutex<String>,
-    content_length: std::sync::Mutex<u64>,
-    cache: std::sync::Mutex<Option<RangeCache>>,
+    url: Mutex<String>,
+    content_length: Mutex<u64>,
+    cache: Arc<Mutex<Option<RangeCache>>>,
+    disk_cache: Arc<Mutex<Option<DiskCache>>>,
+    last_read: Arc<Mutex<Option<(u64, usize)>>>,
+    writeback: bool,
+    prefetch: bool,
 }
 
 struct RangeCache {
     start: u64,
     data: Vec<u8>,
+}
+
+struct DiskCache {
+    dir: PathBuf,
+    max_bytes: u64,
+    current_bytes: u64,
+    entries: HashMap<u64, CacheEntry>,
+    lru: VecDeque<u64>,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    path: PathBuf,
+    size: u64,
+}
+
+impl DiskCache {
+    fn new(dir: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            dir,
+            max_bytes,
+            current_bytes: 0,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let entry = self.entries.get(&offset)?;
+        let mut data = Vec::new();
+        let mut file = std::fs::File::open(&entry.path).ok()?;
+        file.read_to_end(&mut data).ok()?;
+        if data.len() < len {
+            return None;
+        }
+        self.touch(offset);
+        Some(data[..len].to_vec())
+    }
+
+    fn put(&mut self, offset: u64, data: Vec<u8>) -> io::Result<()> {
+        let size = data.len() as u64;
+        self.evict_to_fit(size);
+
+        let filename = format!("{}.bin", offset);
+        let path = self.dir.join(filename);
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+
+        self.entries.insert(offset, CacheEntry { path, size });
+        self.current_bytes = self.current_bytes.saturating_add(size);
+        self.touch(offset);
+        Ok(())
+    }
+
+    fn touch(&mut self, offset: u64) {
+        if let Some(pos) = self.lru.iter().position(|&v| v == offset) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(offset);
+    }
+
+    fn evict_to_fit(&mut self, incoming: u64) {
+        while self.current_bytes.saturating_add(incoming) > self.max_bytes {
+            if let Some(oldest) = self.lru.pop_front() {
+                if let Some(entry) = self.entries.remove(&oldest) {
+                    let _ = std::fs::remove_file(&entry.path);
+                    self.current_bytes = self.current_bytes.saturating_sub(entry.size);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
 }
 
 impl HttpRangeReader {
@@ -597,12 +810,18 @@ impl HttpRangeReader {
 
         let content_length = content_len.ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing content length for remote media"))?;
 
+        let disk_cache = init_disk_cache();
+
         Ok(Self {
             client,
             origin_url,
-            url: std::sync::Mutex::new(url),
-            content_length: std::sync::Mutex::new(content_length),
-            cache: std::sync::Mutex::new(None),
+            url: Mutex::new(url),
+            content_length: Mutex::new(content_length),
+            cache: Arc::new(Mutex::new(None)),
+            disk_cache: Arc::new(Mutex::new(disk_cache)),
+            last_read: Arc::new(Mutex::new(None)),
+            writeback: writeback_enabled(),
+            prefetch: prefetch_enabled(),
         })
     }
 
@@ -612,8 +831,19 @@ impl HttpRangeReader {
         }
 
         if let Some(buf) = self.try_read_from_cache(offset, len) {
+            UrlMetrics::hit_cache(len as u64);
+            self.track_sequential(offset, len);
             return Ok(buf);
         }
+
+        if let Some(buf) = self.try_read_from_disk_cache(offset, len) {
+            UrlMetrics::hit_cache(len as u64);
+            self.update_cache(offset, buf.clone());
+            self.track_sequential(offset, len);
+            return Ok(buf);
+        }
+
+        UrlMetrics::miss_cache(len as u64);
 
         let mut content_length = *self.content_length.lock().map_err(|_| {
             Error::new(ErrorKind::Other, "Range reader poisoned")
@@ -630,7 +860,7 @@ impl HttpRangeReader {
             }
         }
 
-        let read_ahead = read_ahead_bytes();
+        let read_ahead = if self.prefetch { 0 } else { read_ahead_bytes() };
         let fetch_len = std::cmp::max(len, read_ahead);
         let end = std::cmp::min(offset + fetch_len as u64 - 1, content_length - 1);
         let expected_len = (end - offset + 1) as usize;
@@ -640,8 +870,11 @@ impl HttpRangeReader {
         match self.try_read_range(&url, &range_header, expected_len) {
             Ok(buf) => {
                 self.update_cache(offset, buf.clone());
+                self.update_disk_cache(offset, buf.clone());
                 let return_len = std::cmp::min(len, buf.len());
-                Ok(buf[..return_len].to_vec())
+                let out = buf[..return_len].to_vec();
+                self.track_sequential(offset, len);
+                Ok(out)
             }
             Err(e) => {
                 // Attempt a refresh (e.g., signed URL expired) and retry once.
@@ -650,8 +883,11 @@ impl HttpRangeReader {
                     return self.try_read_range(&refreshed_url, &range_header, expected_len)
                         .map(|buf| {
                             self.update_cache(offset, buf.clone());
+                            self.update_disk_cache(offset, buf.clone());
                             let return_len = std::cmp::min(len, buf.len());
-                            buf[..return_len].to_vec()
+                            let out = buf[..return_len].to_vec();
+                            self.track_sequential(offset, len);
+                            out
                         })
                         .map_err(|_| e);
                 }
@@ -681,11 +917,95 @@ impl HttpRangeReader {
         }
     }
 
+    fn try_read_from_disk_cache(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let mut cache = self.disk_cache.lock().ok()?;
+        let cache = cache.as_mut()?;
+        cache.get(offset, len)
+    }
+
+    fn update_disk_cache(&self, offset: u64, data: Vec<u8>) {
+        if self.writeback {
+            let cache = Arc::clone(&self.disk_cache);
+            std::thread::spawn(move || {
+                if let Ok(mut lock) = cache.lock() {
+                    if let Some(cache) = lock.as_mut() {
+                        let _ = cache.put(offset, data);
+                    }
+                }
+            });
+        } else {
+            if let Ok(mut lock) = self.disk_cache.lock() {
+                if let Some(cache) = lock.as_mut() {
+                    let _ = cache.put(offset, data);
+                }
+            }
+        }
+    }
+
+    fn track_sequential(&self, offset: u64, len: usize) {
+        if !self.prefetch {
+            return;
+        }
+        let mut last = match self.last_read.lock() {
+            Ok(lock) => lock,
+            Err(_) => return,
+        };
+        let should_prefetch = match *last {
+            Some((prev_offset, prev_len)) => offset == prev_offset + prev_len as u64,
+            None => false,
+        };
+        *last = Some((offset, len));
+
+        if should_prefetch {
+            let next_offset = offset + len as u64;
+            let prefetch_len = read_ahead_bytes();
+            let this = self.clone_for_prefetch();
+            std::thread::spawn(move || {
+                let _ = this.prefetch_range(next_offset, prefetch_len);
+            });
+        }
+    }
+
+    fn prefetch_range(&self, offset: u64, len: usize) -> io::Result<()> {
+        let content_length = *self.content_length.lock().map_err(|_| {
+            Error::new(ErrorKind::Other, "Range reader poisoned")
+        })?;
+        if offset >= content_length {
+            return Ok(());
+        }
+        let end = std::cmp::min(offset + len as u64 - 1, content_length - 1);
+        let expected_len = (end - offset + 1) as usize;
+        let range_header = format!("bytes={}-{}", offset, end);
+        let url = self.url.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?.clone();
+        if let Ok(buf) = self.try_read_range(&url, &range_header, expected_len) {
+            self.update_cache(offset, buf.clone());
+            self.update_disk_cache(offset, buf);
+        }
+        Ok(())
+    }
+
+    fn clone_for_prefetch(&self) -> HttpRangeReader {
+        HttpRangeReader {
+            client: self.client.clone(),
+            origin_url: self.origin_url.clone(),
+            url: Mutex::new(self.url.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+            content_length: Mutex::new(*self.content_length.lock().unwrap_or_else(|p| p.into_inner())),
+            cache: Arc::clone(&self.cache),
+            disk_cache: Arc::clone(&self.disk_cache),
+            last_read: Arc::clone(&self.last_read),
+            writeback: self.writeback,
+            prefetch: self.prefetch,
+        }
+    }
+
     fn try_read_range(&self, url: &str, range_header: &str, expected_len: usize) -> io::Result<Vec<u8>> {
+        let start = Instant::now();
         let mut resp = self.client.get(url)
             .header(RANGE, range_header)
             .send()
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+        UrlMetrics::range_request(start.elapsed().as_millis() as u64);
 
         let status = resp.status().as_u16();
         if status != 206 {

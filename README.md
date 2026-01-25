@@ -3,7 +3,7 @@
 ![MirageFS Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:FF4500&height=220&section=header&text=MirageFS&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=2&stroke=FF4500&strokeWidth=2&desc=The%20Invisible%20Filesystem&descSize=20&descAlignY=60)
 
 
-![Version](https://img.shields.io/badge/version-1.4.0-blue.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.5.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
@@ -135,6 +135,12 @@ mirage /tmp/secret cover.png movie.mp4
 
 ```
 
+You can also force a local mount to be read-only:
+
+```bash
+mirage /tmp/secret cover.png --read-only
+```
+
 ### 2️⃣.1 Remote Media URLs (Read-Only)
 
 You can mount a **remote** carrier by passing an `http://` or `https://` URL. URL media is **read-only** and runs in WebDAV mode if FUSE is unavailable.
@@ -152,6 +158,9 @@ mirage /tmp/secret https://example.com/secret.mp4
 * `--format` is **not** allowed with URL media.
 * You can set a safety cap for remote downloads with `MIRAGE_URL_MAX_BYTES` (default: 2 GiB).
 * You can increase read-ahead for MP4 URL streaming with `MIRAGE_URL_READAHEAD` (bytes, default: 524288).
+* Optional URL disk cache: set `MIRAGE_URL_CACHE_DIR` and `MIRAGE_URL_CACHE_MAX` (bytes, default: 512 MiB).
+* Async cache writes: set `MIRAGE_URL_WRITEBACK=1`.
+* Prefetch next range: set `MIRAGE_URL_PREFETCH=1` (disabled by default).
 
 ### 3️⃣ Web UI (Browser Access)
 
@@ -161,6 +170,7 @@ You can access the new graphical interface by opening the server address in any 
 
 * **Drag & Drop:** Upload files instantly.
 * **Manage:** Create folders, delete items, and browse your hidden filesystem.
+* **Metrics:** `http://127.0.0.1:8080/__metrics`
 
 ### 4️⃣ WebDAV Mode (Manual / Network Share)
 

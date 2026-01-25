@@ -1,5 +1,6 @@
 // src/webdav_server.rs
 use crate::mirage_fs::{MirageFS, MirageFileType};
+use crate::url_media::url_metrics_json;
 #[path = "web_assets.rs"]
 mod web_assets;
 
@@ -486,6 +487,14 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
                             hyper::Response::builder()
                             .header("Content-Type", "text/html")
                             .body(Body::from(Bytes::from(web_assets::HTML)))
+                            .unwrap()
+                        );
+                    }
+                    if req.method() == Method::GET && req.uri().path() == "/__metrics" {
+                        return Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(Bytes::from(url_metrics_json())))
                             .unwrap()
                         );
                     }
