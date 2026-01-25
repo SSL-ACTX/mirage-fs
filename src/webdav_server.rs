@@ -13,7 +13,7 @@ use dav_server::{
 use std::sync::{Arc, Mutex};
 use std::io::SeekFrom;
 use std::net::SocketAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use futures::FutureExt;
 use bytes::{Bytes, Buf};
 use dav_server::fakels::FakeLs;
@@ -257,20 +257,22 @@ impl DavFileSystem for MirageWebDav {
         let path_str = path.as_pathbuf().to_string_lossy().to_string();
 
         async move {
-            let entries = tokio::task::spawn_blocking(move || {
+            let (entries, frozen_secs) = tokio::task::spawn_blocking(move || {
                 let locked_fs = fs.lock().unwrap();
-                if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
+                let frozen = locked_fs.frozen_time_secs();
+                let entries = if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
                     locked_fs.readdir_internal(ino)
                 } else {
                     Vec::new()
-                }
+                };
+                (entries, frozen)
             }).await.unwrap();
 
-            let stream = futures::stream::iter(entries.into_iter().map(|(_ino, name, kind)| {
+            let stream = futures::stream::iter(entries.into_iter().map(move |(_ino, name, kind)| {
                 // Return dummy metadata for listing; real metadata fetched on demand
                 let meta = MirageMetaData {
                     len: 0,
-                    modified: SystemTime::now(),
+                    modified: SystemTime::UNIX_EPOCH + Duration::from_secs(frozen_secs),
                                                                        is_dir: match kind { MirageFileType::Directory => true, _ => false }
                 };
 

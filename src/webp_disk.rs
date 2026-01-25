@@ -2,7 +2,8 @@
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use std::io::{self, Result};
 use std::path::PathBuf;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, metadata};
+use filetime::{FileTime, set_file_times};
 use img_parts::riff::{RiffChunk, RiffContent};
 use img_parts::Bytes;
 use chacha20poly1305::{
@@ -10,7 +11,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce
 };
 use rand::{RngCore, thread_rng};
-use log::{info, debug};
+use log::{info, debug, warn};
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
     Argon2
@@ -29,10 +30,16 @@ pub struct WebPDisk {
     raw_storage: Vec<u8>,
     // Store the parsed container directly so we can modify in-place
     webp_structure: img_parts::webp::WebP,
+    atime: FileTime,
+    mtime: FileTime,
 }
 
 impl WebPDisk {
     pub fn new(path: PathBuf, password: &str, format: bool) -> io::Result<Self> {
+        let meta = metadata(&path)?;
+        let atime = FileTime::from_last_access_time(&meta);
+        let mtime = FileTime::from_last_modification_time(&meta);
+
         let file_data = fs::read(&path)?;
 
         // Parse WebP
@@ -114,7 +121,15 @@ impl WebPDisk {
             }
         }
 
-        Ok(WebPDisk { path, cipher, raw_storage, webp_structure: webp })
+        let disk = WebPDisk { path, cipher, raw_storage, webp_structure: webp, atime, mtime };
+        if let Err(e) = disk.restore_times() {
+            warn!("WebP: Failed to restore carrier timestamps: {}", e);
+        }
+        Ok(disk)
+    }
+
+    fn restore_times(&self) -> io::Result<()> {
+        set_file_times(&self.path, self.atime, self.mtime)
     }
 
     fn dilute_entropy(input: &[u8]) -> Vec<u8> {
@@ -224,7 +239,9 @@ impl BlockDevice for WebPDisk {
 
     fn resize(&mut self, block_count: u64) -> Result<()> {
         let new_len = SALT_SIZE + (block_count as usize * ENCRYPTED_BLOCK_SIZE);
-        self.raw_storage.resize(new_len, 0);
+        if new_len < self.raw_storage.len() {
+            self.raw_storage.resize(new_len, 0);
+        }
         Ok(())
     }
 
@@ -253,6 +270,6 @@ impl BlockDevice for WebPDisk {
 
         self.webp_structure.clone().encoder().write_to(&mut file)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        Ok(())
+        self.restore_times()
     }
 }

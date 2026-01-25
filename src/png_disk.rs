@@ -2,6 +2,8 @@
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use std::io::{self, Result};
 use std::path::PathBuf;
+use std::fs::metadata;
+use filetime::{FileTime, set_file_times};
 use std::collections::HashSet;
 use image::RgbImage;
 use chacha20poly1305::{
@@ -93,10 +95,16 @@ pub struct PngDisk {
     permutator: FeistelPermutator,
     salt_indices: HashSet<u32>,
     sorted_salt_indices: Vec<u32>,
+    atime: FileTime,
+    mtime: FileTime,
 }
 
 impl PngDisk {
     pub fn new(path: PathBuf, password: &str, format: bool) -> io::Result<Self> {
+        let meta = metadata(&path)?;
+        let atime = FileTime::from_last_access_time(&meta);
+        let mtime = FileTime::from_last_modification_time(&meta);
+
         let mut img = image::open(&path)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
         .to_rgb8();
@@ -161,7 +169,7 @@ impl PngDisk {
         // 4. Initialize Permutator
         let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
 
-        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices };
+        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices, atime, mtime };
 
         // 5. Integrity Check
         if !format {
@@ -171,7 +179,14 @@ impl PngDisk {
             }
         }
 
+        if let Err(e) = disk.restore_times() {
+            warn!("PNG: Failed to restore carrier timestamps: {}", e);
+        }
         Ok(disk)
+    }
+
+    fn restore_times(&self) -> io::Result<()> {
+        set_file_times(&self.path, self.atime, self.mtime)
     }
 
     // --- Core Helpers ---
@@ -343,6 +358,7 @@ impl BlockDevice for PngDisk {
 
     fn sync(&mut self) -> Result<()> {
         self.img.save(&self.path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.restore_times()
     }
 }

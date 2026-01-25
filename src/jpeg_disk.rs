@@ -2,7 +2,8 @@
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use std::io::{self, Result};
 use std::path::PathBuf;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, metadata};
+use filetime::{FileTime, set_file_times};
 use img_parts::jpeg::{Jpeg, JpegSegment};
 use img_parts::Bytes;
 use chacha20poly1305::{
@@ -10,7 +11,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce
 };
 use rand::{RngCore, thread_rng};
-use log::{info, debug};
+use log::{info, debug, warn};
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
     Argon2
@@ -33,10 +34,16 @@ pub struct JpegDisk {
     cipher: ChaCha20Poly1305,
     raw_storage: Vec<u8>,
     jpeg_structure: Jpeg,
+    atime: FileTime,
+    mtime: FileTime,
 }
 
 impl JpegDisk {
     pub fn new(path: PathBuf, password: &str, format: bool) -> io::Result<Self> {
+        let meta = metadata(&path)?;
+        let atime = FileTime::from_last_access_time(&meta);
+        let mtime = FileTime::from_last_modification_time(&meta);
+
         let file_data = fs::read(&path)?;
         let mut jpeg = Jpeg::from_bytes(Bytes::from(file_data))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -117,7 +124,15 @@ impl JpegDisk {
             }
         }
 
-        Ok(JpegDisk { path, cipher, raw_storage, jpeg_structure: jpeg })
+        let disk = JpegDisk { path, cipher, raw_storage, jpeg_structure: jpeg, atime, mtime };
+        if let Err(e) = disk.restore_times() {
+            warn!("JPEG: Failed to restore carrier timestamps: {}", e);
+        }
+        Ok(disk)
+    }
+
+    fn restore_times(&self) -> io::Result<()> {
+        set_file_times(&self.path, self.atime, self.mtime)
     }
 
     // --- Entropy Management ---
@@ -242,7 +257,9 @@ impl BlockDevice for JpegDisk {
 
     fn resize(&mut self, block_count: u64) -> Result<()> {
         let new_len = SALT_SIZE + (block_count as usize * ENCRYPTED_BLOCK_SIZE);
-        self.raw_storage.resize(new_len, 0);
+        if new_len < self.raw_storage.len() {
+            self.raw_storage.resize(new_len, 0);
+        }
         Ok(())
     }
 
@@ -282,6 +299,74 @@ impl BlockDevice for JpegDisk {
 
         self.jpeg_structure.clone().encoder().write_to(&mut file)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        Ok(())
+        self.restore_times()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_device::BLOCK_SIZE;
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ColorType;
+    use std::fs::File;
+    use tempfile::tempdir;
+    use filetime::FileTime;
+
+    fn write_test_jpeg(path: &std::path::Path, width: u32, height: u32, quality: u8) -> io::Result<u64> {
+        let mut img = Vec::with_capacity((width * height * 3) as usize);
+        for _ in 0..(width * height) {
+            img.extend_from_slice(&[12u8, 34u8, 56u8]);
+        }
+
+        let mut file = File::create(path)?;
+        let mut encoder = JpegEncoder::new_with_quality(&mut file, quality);
+        encoder.encode(&img, width, height, ColorType::Rgb8)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    #[test]
+    fn jpeg_format_does_not_bloat_or_change_mtime() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.jpg");
+
+        let initial_size = write_test_jpeg(&path, 128, 128, 80).unwrap();
+        let meta_before = std::fs::metadata(&path).unwrap();
+        let mtime_before = FileTime::from_last_modification_time(&meta_before);
+        let atime_before = FileTime::from_last_access_time(&meta_before);
+
+        let mut disk = JpegDisk::new(path.clone(), "pass", true).unwrap();
+        let block = [0u8; BLOCK_SIZE];
+        disk.write_block(0, &block).unwrap();
+        disk.sync().unwrap();
+
+        let meta_after = std::fs::metadata(&path).unwrap();
+        let size_after = meta_after.len();
+        let mtime_after = FileTime::from_last_modification_time(&meta_after);
+        let atime_after = FileTime::from_last_access_time(&meta_after);
+
+        assert!(size_after <= initial_size + 200_000, "jpeg bloated: {} -> {}", initial_size, size_after);
+        assert_eq!(mtime_after, mtime_before);
+        assert_eq!(atime_after, atime_before);
+    }
+
+    #[test]
+    fn jpeg_write_multiple_blocks_does_not_bloat() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test2.jpg");
+
+        let initial_size = write_test_jpeg(&path, 256, 256, 80).unwrap();
+
+        let mut disk = JpegDisk::new(path.clone(), "pass", true).unwrap();
+        let block = [0u8; BLOCK_SIZE];
+        for i in 0..24u32 { // ~96 KiB of data
+            disk.write_block(i, &block).unwrap();
+        }
+        disk.sync().unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(size_after <= initial_size + 300_000, "jpeg bloated: {} -> {}", initial_size, size_after);
     }
 }

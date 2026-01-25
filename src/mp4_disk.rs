@@ -3,6 +3,7 @@ use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
 use std::io::{self, Result, Read, Write, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
+use filetime::{FileTime, set_file_times};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce
@@ -39,6 +40,8 @@ pub struct Mp4Disk {
     file: File,
     data_start_offset: u64,
     data_length: u64,
+    atime: FileTime,
+    mtime: FileTime,
 }
 
 impl Mp4Disk {
@@ -47,6 +50,10 @@ impl Mp4Disk {
         .read(true)
         .write(true)
         .open(&path)?;
+
+        let meta = file.metadata()?;
+        let atime = FileTime::from_last_access_time(&meta);
+        let mtime = FileTime::from_last_modification_time(&meta);
 
         // 1. Scan Atoms
         let (mdat_offset, mdat_size, exists) = Self::scan_for_mirage_mdat(&mut file)?;
@@ -111,13 +118,22 @@ impl Mp4Disk {
         let key = Key::from_slice(&key_buffer);
         let cipher = ChaCha20Poly1305::new(key);
 
-        Ok(Mp4Disk {
+        let disk = Mp4Disk {
             path,
             cipher,
             file,
             data_start_offset: data_start,
             data_length: current_payload_len,
-        })
+            atime,
+            mtime,
+        };
+
+        disk.restore_times()?;
+        Ok(disk)
+    }
+
+    fn restore_times(&self) -> io::Result<()> {
+        set_file_times(&self.path, self.atime, self.mtime)
     }
 
     fn scan_for_mirage_mdat(file: &mut File) -> io::Result<(u64, u64, bool)> {
@@ -257,7 +273,7 @@ impl BlockDevice for Mp4Disk {
             w.write_all(&ciphertext)
         })?;
 
-        Ok(())
+        self.restore_times()
     }
 
     fn resize(&mut self, block_count: u64) -> Result<()> {
@@ -275,10 +291,11 @@ impl BlockDevice for Mp4Disk {
             self.data_length = new_len;
             self.update_atom_size()?;
         }
-        Ok(())
+        self.restore_times()
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.file.sync_all()
+        self.file.sync_all()?;
+        self.restore_times()
     }
 }

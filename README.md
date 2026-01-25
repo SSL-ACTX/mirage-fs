@@ -36,6 +36,12 @@ MirageFS now ships with a stunning, self-hosted **Web Management UI** served dir
 * **Drag & Drop Upload:** Encrypt files instantly by dragging them into the browser window.
 * **Zero Client Setup:** Works on any device with a web browser (Mobile/Desktop) without installing WebDAV clients.
 
+### 🕒 Timestamp Freeze (Anti-Forensics)
+MirageFS now **freezes all filesystem timestamps** (mtime/atime/ctime) to a fixed value so filesystem activity never updates visible times.
+* **FUSE + WebDAV:** All file metadata reports a fixed time.
+* **Carrier Files:** Media timestamps are restored after access and writes.
+* **Note:** On Linux, kernel `ctime` cannot be user-set; MirageFS avoids touching it by restoring carrier times after IO.
+
 ### 🌐 Universal Driverless Access
 MirageFS includes an embedded **WebDAV Server**.
 * **No Drivers Required:** Works on restricted systems (corporate laptops, public computers) where you cannot install FUSE or kernel drivers.
@@ -63,6 +69,7 @@ MirageFS is not just a key-value store; it is a compliant POSIX-like filesystem.
 * **Directory Support:** Create nested folders (`mkdir`), remove them (`rmdir`), and organize your data hierarchy.
 * **Atomic Renames:** Move and rename files/folders instantly (`mv`).
 * **Auto-Shrink:** Deleting files triggers a "swap-and-pop" compaction. The MP4 container physically shrinks on disk to reflect the deleted data, leaving no "slack space" evidence.
+* **Compact Metadata:** Metadata blocks grow dynamically and no longer cause large size jumps for small carriers.
 
 ---
 
@@ -235,6 +242,11 @@ Compressed formats like JPEG destroy LSB data. MirageFS exploits the metadata la
 1. **Dilution:** High-entropy encrypted data is expanded (7 bits → 8 bytes) to lower its statistical randomness.
 2. **Camouflage:** Data is wrapped in valid **TIFF headers** and labeled as `DNGPrivateData` (Tag `0xC634`).
 3. **Result:** Forensic tools ignore the data, identifying it as "proprietary Adobe metadata" rather than a suspicious payload.
+
+### 🧪 Regression Tests
+MirageFS includes unit tests to prevent:
+* JPEG carrier bloat when formatting or writing data.
+* Timestamp drift after filesystem operations.
 
 ---
 
