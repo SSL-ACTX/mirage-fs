@@ -5,7 +5,7 @@
 
 ![Version](https://img.shields.io/badge/version-1.5.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
-![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)
+![License](https://img.shields.io/badge/license-AGPL_3.0-green.svg?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
 
 **Mount encrypted, hidden storage inside innocent media files.**
