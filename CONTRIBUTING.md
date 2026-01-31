@@ -89,7 +89,7 @@ If you find a bug but don't know how to fix it, please open an Issue!
 
 ## 📜 License
 
-By contributing, you agree that your contributions will be licensed under the MIT License, as defined in the `README.md`.
+By contributing, you agree that your contributions will be licensed under the AGPL-3.0 License, as defined in the `README.md`.
 
 ---
 
