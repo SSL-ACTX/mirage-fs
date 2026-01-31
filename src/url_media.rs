@@ -7,6 +7,7 @@ use crate::mp4_disk::Mp4Disk;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -47,6 +48,41 @@ enum MediaKind {
     Jpeg,
     Webp,
     Mp4,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use image::{RgbImage, Rgb};
+
+    #[test]
+    fn detect_png_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        let mut img = RgbImage::new(32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                img.put_pixel(x, y, Rgb([12u8, 34u8, 56u8]));
+            }
+        }
+        img.save(&path).unwrap();
+        assert_eq!(detect_media_kind_from_file(&path), Some(MediaKind::Png));
+    }
+
+    #[test]
+    fn detect_jpeg_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.jpg");
+        let mut img = RgbImage::new(32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                img.put_pixel(x, y, Rgb([12u8, 34u8, 56u8]));
+            }
+        }
+        img.save(&path).unwrap();
+        assert_eq!(detect_media_kind_from_file(&path), Some(MediaKind::Jpeg));
+    }
 }
 
 struct UrlMetrics {
@@ -127,16 +163,15 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(Policy::limited(10))
-        .user_agent("MirageFS/1.4.0")
+        .user_agent("MirageFS/1.5.0")
         .build()?;
 
     let resolved_url = resolve_media_url(&client, &url, 8)?;
     let head_info = fetch_head_info(&client, &resolved_url);
-    let kind = detect_media_kind(&head_info.final_url, head_info.content_type.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
+    let initial_hint = detect_media_kind(&head_info.final_url, head_info.content_type.as_deref());
 
-    match kind {
-        MediaKind::Mp4 => {
+    match initial_hint {
+        Some(MediaKind::Mp4) => {
             let reader = HttpRangeReader::new(
                 client,
                 url.to_string(),
@@ -146,18 +181,53 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
             let disk = UrlMp4Disk::new(reader, password)?;
             Ok(Box::new(ReadOnlyDevice::new(Box::new(disk), None)))
         }
-        MediaKind::Png | MediaKind::Jpeg | MediaKind::Webp => {
+        Some(MediaKind::Png) | Some(MediaKind::Jpeg) | Some(MediaKind::Webp) => {
+            // Download into memory (avoid persisting debug files on disk for cloud sources)
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let resolved = resolve_media_url(&client, &head_info.final_url, 8)?;
+                let mut resp = client.get(&resolved).send()?.error_for_status()?;
+                resp.read_to_end(&mut buf)?;
+            }
+
+            // Detect from bytes first
+            let file_kind = detect_media_kind_from_bytes(&buf).or(initial_hint);
+            let chosen = file_kind.ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
+
+            let disk: Box<dyn BlockDevice> = match chosen {
+                MediaKind::Png => {
+                    // Try building PngDisk from in-memory bytes (decode to image in-memory)
+                    if let Ok(img) = image::load_from_memory(&buf) {
+                        Box::new(PngDisk::from_image_pathless(img.to_rgb8(), password, false)?)
+                    } else {
+                        anyhow::bail!("Failed to decode PNG from remote bytes");
+                    }
+                }
+                MediaKind::Jpeg => {
+                    // JpegDisk can be constructed from bytes
+                    Box::new(JpegDisk::from_bytes(buf.clone(), password, false)?)
+                }
+                MediaKind::Webp => {
+                    // WebP: construct WebPDisk directly from bytes (in-memory)
+                    Box::new(WebPDisk::from_bytes(buf.clone(), password, false)?)
+                }
+                MediaKind::Mp4 => unreachable!(),
+            };
+
+            Ok(Box::new(ReadOnlyDevice::new(disk, None)))
+        }
+        None => {
+            // No reliable hint: download and detect from file contents
             let temp_dir = tempfile::TempDir::new()?;
             let file_path = temp_dir.path().join("mirage_media");
             download_to_file(&client, &head_info.final_url, &file_path)?;
-
-            let disk: Box<dyn BlockDevice> = match kind {
+            let file_kind = detect_media_kind_from_file(&file_path).ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
+            let disk: Box<dyn BlockDevice> = match file_kind {
                 MediaKind::Png => Box::new(PngDisk::new(file_path, password, false)?),
                 MediaKind::Jpeg => Box::new(JpegDisk::new(file_path, password, false)?),
                 MediaKind::Webp => Box::new(WebPDisk::new(file_path, password, false)?),
                 MediaKind::Mp4 => unreachable!(),
             };
-
             Ok(Box::new(ReadOnlyDevice::new(disk, Some(temp_dir))))
         }
     }
@@ -219,6 +289,47 @@ fn detect_media_kind(url: &str, content_type: Option<&str>) -> Option<MediaKind>
         if ct.contains("image/webp") { return Some(MediaKind::Webp); }
         if ct.contains("video/mp4") { return Some(MediaKind::Mp4); }
         if ct.contains("video/quicktime") { return Some(MediaKind::Mp4); }
+    }
+    None
+}
+
+fn detect_media_kind_from_file(path: &Path) -> Option<MediaKind> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = [0u8; 2048];
+    let read = f.read(&mut buf).ok()?;
+    let slice = &buf[..read];
+
+    if slice.len() >= 3 && slice[0] == 0xFF && slice[1] == 0xD8 && slice[2] == 0xFF {
+        return Some(MediaKind::Jpeg);
+    }
+    if slice.len() >= 8 && &slice[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return Some(MediaKind::Png);
+    }
+    if slice.len() >= 12 && &slice[0..4] == b"RIFF" && &slice[8..12] == b"WEBP" {
+        return Some(MediaKind::Webp);
+    }
+    if slice.len() >= 12 {
+        if &slice[4..8] == b"ftyp" {
+            return Some(MediaKind::Mp4);
+        }
+    }
+    None
+}
+
+fn detect_media_kind_from_bytes(buf: &[u8]) -> Option<MediaKind> {
+    if buf.len() >= 3 && buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF {
+        return Some(MediaKind::Jpeg);
+    }
+    if buf.len() >= 8 && &buf[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return Some(MediaKind::Png);
+    }
+    if buf.len() >= 12 && &buf[0..4] == b"RIFF" && &buf[8..12] == b"WEBP" {
+        return Some(MediaKind::Webp);
+    }
+    if buf.len() >= 12 {
+        if &buf[4..8] == b"ftyp" {
+            return Some(MediaKind::Mp4);
+        }
     }
     None
 }

@@ -128,7 +128,81 @@ impl WebPDisk {
         Ok(disk)
     }
 
+    pub fn from_bytes(bytes: Vec<u8>, password: &str, format: bool) -> io::Result<Self> {
+        let webp = img_parts::webp::WebP::from_bytes(Bytes::from(bytes.clone()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let path = PathBuf::new();
+        let atime = FileTime::from_unix_time(0, 0);
+        let mtime = FileTime::from_unix_time(0, 0);
+
+        let mut encoded_storage = Vec::new();
+        let chunks = webp.chunks();
+
+        for chunk in chunks {
+            if chunk.id() == EXIF_CHUNK_ID {
+                if let RiffContent::Data(contents) = chunk.content() {
+                    if contents.len() > STRUCTURE_OVERHEAD
+                        && &contents[0..8] == TIFF_HEADER
+                        && contents[10] == DNG_TAG[0] && contents[11] == DNG_TAG[1] {
+                            encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
+                            break;
+                        }
+                }
+            }
+        }
+
+        let raw_storage = if !format {
+            if encoded_storage.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "No MirageFS (WebP) found."));
+            }
+            Self::concentrate_entropy(&encoded_storage)
+        } else {
+            let mut salt = [0u8; SALT_SIZE];
+            thread_rng().fill_bytes(&mut salt);
+            salt.to_vec()
+        };
+
+        if raw_storage.len() < SALT_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Storage too small."));
+        }
+
+        let salt_slice = &raw_storage[0..16];
+        debug!("Deriving key...");
+        let salt_string = SaltString::encode_b64(salt_slice)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let argon2 = Argon2::default();
+        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut key_buffer = [0u8; 32];
+        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
+
+        let key = Key::from_slice(&key_buffer);
+        let cipher = ChaCha20Poly1305::new(key);
+
+        if !format {
+            let start = SALT_SIZE;
+            let end = SALT_SIZE + ENCRYPTED_BLOCK_SIZE;
+            if raw_storage.len() >= end {
+                let packet = &raw_storage[start..end];
+                let nonce = Nonce::from_slice(&packet[0..12]);
+                let ciphertext = &packet[12..];
+                if cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }).is_err() {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed."));
+                }
+            }
+        }
+
+        let disk = WebPDisk { path, cipher, raw_storage, webp_structure: webp, atime, mtime };
+        Ok(disk)
+    }
+
     fn restore_times(&self) -> io::Result<()> {
+        if self.path.as_os_str().is_empty() || !self.path.exists() {
+            return Ok(());
+        }
         set_file_times(&self.path, self.atime, self.mtime)
     }
 

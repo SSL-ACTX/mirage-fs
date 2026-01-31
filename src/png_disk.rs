@@ -185,7 +185,90 @@ impl PngDisk {
         Ok(disk)
     }
 
+    pub fn from_image(path: PathBuf, mut img: RgbImage, password: &str, format: bool) -> io::Result<Self> {
+        let meta = metadata(&path).ok();
+        let atime = meta.as_ref().map(|m| FileTime::from_last_access_time(m)).unwrap_or_else(|| FileTime::from_unix_time(0, 0));
+        let mtime = meta.as_ref().map(|m| FileTime::from_last_modification_time(m)).unwrap_or_else(|| FileTime::from_unix_time(0, 0));
+
+        let width = img.width();
+        let height = img.height();
+        let total_channels = (width as usize) * (height as usize) * 3;
+
+        if total_channels < SALT_BITS + 4096 {
+            return Err(io::Error::new(io::ErrorKind::Other, "Image too small for MirageFS"));
+        }
+
+        debug!("Deriving salt locations (from_image)...");
+        let loc_seed = Self::derive_location_seed(password)?;
+        let mut salt_vec = Self::generate_salt_indices(loc_seed, total_channels as u32);
+        salt_vec.sort();
+        let sorted_salt_indices = salt_vec.clone();
+        let salt_indices: HashSet<u32> = salt_vec.iter().cloned().collect();
+
+        let mut salt = [0u8; 16];
+
+        if format {
+            info!("PNG: Formatting (Algorithmic Scatter Mode)...");
+            let mut rng = rand::thread_rng();
+            rng.fill(&mut salt);
+            info!("Generated Salt: {}", hex::encode(salt));
+
+            let salt_bits = Self::bytes_to_bits(&salt);
+            for (i, &bit) in salt_bits.iter().enumerate() {
+                Self::write_channel_lsb(&mut img, salt_vec[i], bit);
+            }
+        } else {
+            let mut salt_bits = Vec::with_capacity(SALT_BITS);
+            for idx in &salt_vec {
+                salt_bits.push(Self::read_channel_lsb(&img, *idx));
+            }
+            let salt_bytes = Self::bits_to_bytes(&salt_bits);
+            salt.copy_from_slice(&salt_bytes[0..16]);
+            info!("Read Salt:      {}", hex::encode(salt));
+        }
+
+        let salt_string = SaltString::encode_b64(&salt)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let argon2 = Argon2::default();
+        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let mut key_buffer = [0u8; 32];
+        key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
+
+        let key = Key::from_slice(&key_buffer);
+        let cipher = ChaCha20Poly1305::new(key);
+
+        let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
+
+        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices, atime, mtime };
+
+        if !format {
+            if let Err(e) = disk.read_block(0) {
+                warn!("Block 0 Verify Failed: {}", e);
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed (Auth Tag Mismatch)"));
+            }
+        }
+
+        if let Err(e) = disk.restore_times() {
+            warn!("PNG: Failed to restore carrier timestamps: {}", e);
+        }
+        Ok(disk)
+    }
+
+    // Constructor for in-memory-only creation (no on-disk path)
+    pub fn from_image_pathless(img: RgbImage, password: &str, format: bool) -> io::Result<Self> {
+        // Use an empty PathBuf and zero times since there's no on-disk file
+        let path = PathBuf::new();
+        Self::from_image(path, img, password, format)
+    }
+
     fn restore_times(&self) -> io::Result<()> {
+        if self.path.as_os_str().is_empty() || !self.path.exists() {
+            return Ok(());
+        }
         set_file_times(&self.path, self.atime, self.mtime)
     }
 
