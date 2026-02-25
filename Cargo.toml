@@ -8,7 +8,7 @@ default = ["fuse"]
 fuse = ["dep:fuser"]
 
 [dependencies]
-fuser = { version = "0.12", optional = true }
+fuser = { version = "0.16", optional = true }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.10"
