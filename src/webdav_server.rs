@@ -4,20 +4,22 @@ use crate::url_media::url_metrics_json;
 #[path = "web_assets.rs"]
 mod web_assets;
 
+use bytes::{Buf, Bytes};
+use dav_server::fakels::FakeLs;
 use dav_server::{
-    fs::{DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, OpenOptions},
-    davpath::DavPath,
-    DavHandler,
     body::Body,
+    davpath::DavPath,
+    fs::{
+        DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, OpenOptions,
+    },
+    DavHandler,
 };
-use std::sync::{Arc, Mutex};
+use futures::FutureExt;
+use hyper::Method;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use futures::FutureExt;
-use bytes::{Bytes, Buf};
-use dav_server::fakels::FakeLs;
-use hyper::Method;
 
 // --- Error Mapping Helper ---
 fn map_err(code: i32) -> FsError {
@@ -53,10 +55,18 @@ pub struct MirageMetaData {
 }
 
 impl DavMetaData for MirageMetaData {
-    fn len(&self) -> u64 { self.len }
-    fn modified(&self) -> FsResult<SystemTime> { Ok(self.modified) }
-    fn is_dir(&self) -> bool { self.is_dir }
-    fn created(&self) -> FsResult<SystemTime> { Ok(self.modified) }
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn modified(&self) -> FsResult<SystemTime> {
+        Ok(self.modified)
+    }
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn created(&self) -> FsResult<SystemTime> {
+        Ok(self.modified)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -72,9 +82,7 @@ impl DavDirEntry for MirageDirEntry {
 
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let meta = self.meta.clone();
-        async move {
-            Ok(Box::new(meta) as Box<dyn DavMetaData>)
-        }.boxed()
+        async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
     }
 }
 
@@ -104,10 +112,11 @@ impl DavFile for MirageDavFile {
                 Ok(data) => {
                     self.current_pos += data.len() as u64;
                     Ok(Bytes::from(data))
-                },
+                }
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
@@ -139,10 +148,11 @@ impl DavFile for MirageDavFile {
                 Ok(written) => {
                     self.current_pos += written as u64;
                     Ok(())
-                },
+                }
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
@@ -154,7 +164,9 @@ impl DavFile for MirageDavFile {
             let size = tokio::task::spawn_blocking(move || {
                 let locked_fs = fs.lock().unwrap();
                 locked_fs.get_inode_size(ino).unwrap_or(0)
-            }).await.map_err(|_| FsError::GeneralFailure)?;
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
 
             let new_pos = match pos {
                 SeekFrom::Start(p) => p,
@@ -164,7 +176,8 @@ impl DavFile for MirageDavFile {
 
             self.current_pos = new_pos;
             Ok(new_pos)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
@@ -182,7 +195,8 @@ impl DavFile for MirageDavFile {
             } else {
                 Err(FsError::GeneralFailure)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
@@ -194,19 +208,26 @@ impl DavFile for MirageDavFile {
                 if let Some(inode) = locked_fs.get_inode(ino) {
                     Ok(MirageMetaData {
                         len: inode.attr.size,
-                        modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(inode.attr.mtime_secs),
-                       is_dir: match inode.attr.kind { MirageFileType::Directory => true, _ => false },
+                        modified: SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(inode.attr.mtime_secs),
+                        is_dir: match inode.attr.kind {
+                            MirageFileType::Directory => true,
+                            _ => false,
+                        },
                     })
                 } else {
                     Err(FsError::NotFound)
                 }
-            }).await.map_err(|_| FsError::GeneralFailure)?;
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
 
             match meta {
                 Ok(m) => Ok(Box::new(m) as Box<dyn DavMetaData>),
                 Err(e) => Err(e),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
@@ -231,7 +252,8 @@ impl DavFileSystem for MirageWebDav {
                                 // Truncate if requested
                                 if options.truncate {
                                     // Assuming size 0 implies truncate start
-                                    let _ = locked_fs.set_attr_internal(existing, Some(0), None, None);
+                                    let _ =
+                                        locked_fs.set_attr_internal(existing, Some(0), None, None);
                                 }
                                 return Ok(existing);
                             }
@@ -243,16 +265,30 @@ impl DavFileSystem for MirageWebDav {
                 }
 
                 locked_fs.resolve_path(std::path::Path::new(&path_str))
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match ino_opt {
-                Ok(ino) => Ok(Box::new(MirageDavFile { fs: fs, ino, current_pos: 0 }) as Box<dyn DavFile>),
+                Ok(ino) => Ok(Box::new(MirageDavFile {
+                    fs: fs,
+                    ino,
+                    current_pos: 0,
+                }) as Box<dyn DavFile>),
                 Err(_) => Err(FsError::NotFound),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
-    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: dav_server::fs::ReadDirMeta) -> FsFuture<'a, std::pin::Pin<Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>>> {
+    fn read_dir<'a>(
+        &'a self,
+        path: &'a DavPath,
+        _meta: dav_server::fs::ReadDirMeta,
+    ) -> FsFuture<
+        'a,
+        std::pin::Pin<Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>>,
+    > {
         let fs = self.fs.clone();
         let path_str = path.as_pathbuf().to_string_lossy().to_string();
 
@@ -260,32 +296,43 @@ impl DavFileSystem for MirageWebDav {
             let (entries, frozen_secs) = tokio::task::spawn_blocking(move || {
                 let locked_fs = fs.lock().unwrap();
                 let frozen = locked_fs.frozen_time_secs();
-                let entries = if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
-                    locked_fs.readdir_internal(ino)
-                } else {
-                    Vec::new()
-                };
+                let entries =
+                    if let Ok(ino) = locked_fs.resolve_path(std::path::Path::new(&path_str)) {
+                        locked_fs.readdir_internal(ino)
+                    } else {
+                        Vec::new()
+                    };
                 (entries, frozen)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
-            let stream = futures::stream::iter(entries.into_iter().map(move |(_ino, name, kind)| {
-                // Return dummy metadata for listing; real metadata fetched on demand
-                let meta = MirageMetaData {
-                    len: 0,
-                    modified: SystemTime::UNIX_EPOCH + Duration::from_secs(frozen_secs),
-                                                                       is_dir: match kind { MirageFileType::Directory => true, _ => false }
-                };
+            let stream =
+                futures::stream::iter(entries.into_iter().map(move |(_ino, name, kind)| {
+                    // Return dummy metadata for listing; real metadata fetched on demand
+                    let meta = MirageMetaData {
+                        len: 0,
+                        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(frozen_secs),
+                        is_dir: match kind {
+                            MirageFileType::Directory => true,
+                            _ => false,
+                        },
+                    };
 
-                let entry = MirageDirEntry {
-                    name: name.into_bytes(),
-                                                                       meta,
-                };
+                    let entry = MirageDirEntry {
+                        name: name.into_bytes(),
+                        meta,
+                    };
 
-                Ok(Box::new(entry) as Box<dyn DavDirEntry>)
-            }));
+                    Ok(Box::new(entry) as Box<dyn DavDirEntry>)
+                }));
 
-            Ok(Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>>)
-        }.boxed()
+            Ok(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn futures::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>,
+                >)
+        }
+        .boxed()
     }
 
     fn metadata(&self, path: &DavPath) -> FsFuture<'_, Box<dyn DavMetaData>> {
@@ -299,19 +346,26 @@ impl DavFileSystem for MirageWebDav {
                     if let Some(inode) = locked_fs.get_inode(ino) {
                         return Ok(MirageMetaData {
                             len: inode.attr.size,
-                            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(inode.attr.mtime_secs),
-                                  is_dir: match inode.attr.kind { MirageFileType::Directory => true, _ => false },
+                            modified: SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(inode.attr.mtime_secs),
+                            is_dir: match inode.attr.kind {
+                                MirageFileType::Directory => true,
+                                _ => false,
+                            },
                         });
                     }
                 }
                 Err(libc::ENOENT)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match meta {
                 Ok(m) => Ok(Box::new(m) as Box<dyn DavMetaData>),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn create_dir(&self, path: &DavPath) -> FsFuture<'_, ()> {
@@ -328,13 +382,16 @@ impl DavFileSystem for MirageWebDav {
                     }
                 }
                 Err(libc::EIO)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match res {
                 Ok(_) => Ok(()),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -351,13 +408,16 @@ impl DavFileSystem for MirageWebDav {
                     }
                 }
                 Err(libc::ENOENT)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match res {
                 Ok(_) => Ok(()),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -374,13 +434,16 @@ impl DavFileSystem for MirageWebDav {
                     }
                 }
                 Err(libc::ENOENT)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match res {
                 Ok(_) => Ok(()),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn rename(&self, from: &DavPath, to: &DavPath) -> FsFuture<'_, ()> {
@@ -404,13 +467,16 @@ impl DavFileSystem for MirageWebDav {
                 let parent_ino_to = locked_fs.resolve_path(parent_to).map_err(|e| e)?;
 
                 locked_fs.rename_internal(parent_ino_from, name_from, parent_ino_to, name_to)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match res {
                 Ok(_) => Ok(()),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn copy(&self, from: &DavPath, to: &DavPath) -> FsFuture<'_, ()> {
@@ -423,16 +489,22 @@ impl DavFileSystem for MirageWebDav {
                 let mut locked_fs = fs.lock().unwrap();
 
                 // 1. Resolve Source
-                let src_ino = locked_fs.resolve_path(std::path::Path::new(&from_str)).map_err(|_| libc::ENOENT)?;
+                let src_ino = locked_fs
+                    .resolve_path(std::path::Path::new(&from_str))
+                    .map_err(|_| libc::ENOENT)?;
 
                 // 2. Resolve Dest Parent
                 let p_to = std::path::Path::new(&to_str);
                 let parent_to = p_to.parent().ok_or(libc::EIO)?;
                 let name_to = p_to.file_name().ok_or(libc::EIO)?.to_str().unwrap();
-                let parent_ino_to = locked_fs.resolve_path(parent_to).map_err(|_| libc::ENOENT)?;
+                let parent_ino_to = locked_fs
+                    .resolve_path(parent_to)
+                    .map_err(|_| libc::ENOENT)?;
 
                 // 3. Create Dest File
-                let dest_ino = locked_fs.create_file_internal(parent_ino_to, name_to).map_err(|e| e)?;
+                let dest_ino = locked_fs
+                    .create_file_internal(parent_ino_to, name_to)
+                    .map_err(|e| e)?;
 
                 // 4. Perform Deep Copy (Read Src -> Write Dest)
                 let size = locked_fs.get_inode_size(src_ino).unwrap_or(0);
@@ -451,26 +523,35 @@ impl DavFileSystem for MirageWebDav {
                     }
                 }
                 Ok(())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             match res {
                 Ok(_) => Ok(()),
                 Err(e) => Err(map_err(e)),
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
 pub async fn start_webdav_server(fs: MirageFS, port: u16) {
     let dav_server = DavHandler::builder()
-    .filesystem(Box::new(MirageWebDav::new(fs)))
-    .locksystem(FakeLs::new())
-    .build_handler();
+        .filesystem(Box::new(MirageWebDav::new(fs)))
+        .locksystem(FakeLs::new())
+        .build_handler();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("🌐 WebDAV Server running at http://{}/", addr);
-    println!("   -> Connect via Browser for UI: http://127.0.0.1:{}", port);
-    println!("   -> Connect via WebDAV Client:  http://127.0.0.1:{}", port);
+    println!(
+        "   -> Connect via Browser for UI: http://127.0.0.1:{}",
+        port
+    );
+    println!(
+        "   -> Connect via WebDAV Client:  http://127.0.0.1:{}",
+        port
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
@@ -487,17 +568,17 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
                     if req.method() == Method::GET && req.uri().path() == "/" {
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
-                            .header("Content-Type", "text/html")
-                            .body(Body::from(Bytes::from(web_assets::HTML)))
-                            .unwrap()
+                                .header("Content-Type", "text/html")
+                                .body(Body::from(Bytes::from(web_assets::HTML)))
+                                .unwrap(),
                         );
                     }
                     if req.method() == Method::GET && req.uri().path() == "/__metrics" {
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
-                            .header("Content-Type", "application/json")
-                            .body(Body::from(Bytes::from(url_metrics_json())))
-                            .unwrap()
+                                .header("Content-Type", "application/json")
+                                .body(Body::from(Bytes::from(url_metrics_json())))
+                                .unwrap(),
                         );
                     }
                     Ok::<_, std::convert::Infallible>(dav_server.handle(req).await)
@@ -507,9 +588,9 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
                 .await
-                {
-                    eprintln!("Error serving connection: {:?}", err);
-                }
+            {
+                eprintln!("Error serving connection: {:?}", err);
+            }
         });
     }
 }

@@ -1,21 +1,21 @@
 // src/webp_disk.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
-use std::io::{self, Result};
-use std::path::PathBuf;
-use std::fs::{self, OpenOptions, metadata};
-use filetime::{FileTime, set_file_times};
-use img_parts::riff::{RiffChunk, RiffContent};
-use img_parts::Bytes;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce
-};
-use rand::{RngCore, thread_rng};
-use log::{info, debug, warn};
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
-    Argon2
+    Argon2,
 };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use filetime::{set_file_times, FileTime};
+use img_parts::riff::{RiffChunk, RiffContent};
+use img_parts::Bytes;
+use log::{debug, info, warn};
+use rand::{thread_rng, RngCore};
+use std::fs::{self, metadata, OpenOptions};
+use std::io::{self, Result};
+use std::path::PathBuf;
 
 // WebP uses the 'EXIF' chunk.
 const EXIF_CHUNK_ID: [u8; 4] = *b"EXIF";
@@ -44,7 +44,7 @@ impl WebPDisk {
 
         // Parse WebP
         let mut webp = img_parts::webp::WebP::from_bytes(Bytes::from(file_data))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // 1. Scan for our Data
         let mut encoded_storage = Vec::new();
@@ -57,10 +57,12 @@ impl WebPDisk {
                     // Check signature
                     if contents.len() > STRUCTURE_OVERHEAD
                         && &contents[0..8] == TIFF_HEADER
-                        && contents[10] == DNG_TAG[0] && contents[11] == DNG_TAG[1] {
-                            encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
-                            break;
-                        }
+                        && contents[10] == DNG_TAG[0]
+                        && contents[11] == DNG_TAG[1]
+                    {
+                        encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
+                        break;
+                    }
                 }
             }
         }
@@ -72,7 +74,10 @@ impl WebPDisk {
 
         let raw_storage = if !format {
             if encoded_storage.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "No MirageFS (WebP) found."));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No MirageFS (WebP) found.",
+                ));
             }
             Self::concentrate_entropy(&encoded_storage)
         } else {
@@ -88,19 +93,25 @@ impl WebPDisk {
         }
 
         if raw_storage.len() < SALT_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Storage too small."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Storage too small.",
+            ));
         }
 
         let salt_slice = &raw_storage[0..16];
         debug!("Deriving key...");
         let salt_string = SaltString::encode_b64(salt_slice)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let mut key_buffer = [0u8; 32];
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
         let key = Key::from_slice(&key_buffer);
@@ -115,13 +126,32 @@ impl WebPDisk {
                 let nonce = Nonce::from_slice(&packet[0..12]);
                 let ciphertext = &packet[12..];
 
-                if cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }).is_err() {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed."));
+                if cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &[],
+                        },
+                    )
+                    .is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Decryption Failed.",
+                    ));
                 }
             }
         }
 
-        let disk = WebPDisk { path, cipher, raw_storage, webp_structure: webp, atime, mtime };
+        let disk = WebPDisk {
+            path,
+            cipher,
+            raw_storage,
+            webp_structure: webp,
+            atime,
+            mtime,
+        };
         if let Err(e) = disk.restore_times() {
             warn!("WebP: Failed to restore carrier timestamps: {}", e);
         }
@@ -144,17 +174,22 @@ impl WebPDisk {
                 if let RiffContent::Data(contents) = chunk.content() {
                     if contents.len() > STRUCTURE_OVERHEAD
                         && &contents[0..8] == TIFF_HEADER
-                        && contents[10] == DNG_TAG[0] && contents[11] == DNG_TAG[1] {
-                            encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
-                            break;
-                        }
+                        && contents[10] == DNG_TAG[0]
+                        && contents[11] == DNG_TAG[1]
+                    {
+                        encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
+                        break;
+                    }
                 }
             }
         }
 
         let raw_storage = if !format {
             if encoded_storage.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "No MirageFS (WebP) found."));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No MirageFS (WebP) found.",
+                ));
             }
             Self::concentrate_entropy(&encoded_storage)
         } else {
@@ -164,7 +199,10 @@ impl WebPDisk {
         };
 
         if raw_storage.len() < SALT_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Storage too small."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Storage too small.",
+            ));
         }
 
         let salt_slice = &raw_storage[0..16];
@@ -172,11 +210,14 @@ impl WebPDisk {
         let salt_string = SaltString::encode_b64(salt_slice)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let mut key_buffer = [0u8; 32];
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
         let key = Key::from_slice(&key_buffer);
@@ -189,13 +230,32 @@ impl WebPDisk {
                 let packet = &raw_storage[start..end];
                 let nonce = Nonce::from_slice(&packet[0..12]);
                 let ciphertext = &packet[12..];
-                if cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }).is_err() {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed."));
+                if cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &[],
+                        },
+                    )
+                    .is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Decryption Failed.",
+                    ));
                 }
             }
         }
 
-        let disk = WebPDisk { path, cipher, raw_storage, webp_structure: webp, atime, mtime };
+        let disk = WebPDisk {
+            path,
+            cipher,
+            raw_storage,
+            webp_structure: webp,
+            atime,
+            mtime,
+        };
         Ok(disk)
     }
 
@@ -266,25 +326,35 @@ impl WebPDisk {
 }
 
 impl BlockDevice for WebPDisk {
-    fn block_count(&self) -> u64 { u32::MAX as u64 }
+    fn block_count(&self) -> u64 {
+        u32::MAX as u64
+    }
 
     fn read_block(&self, index: u32) -> Result<[u8; BLOCK_SIZE]> {
         let start_offset = SALT_SIZE + (index as usize * ENCRYPTED_BLOCK_SIZE);
         let end_offset = start_offset + ENCRYPTED_BLOCK_SIZE;
 
-        if end_offset > self.raw_storage.len() { return Ok([0u8; BLOCK_SIZE]); }
+        if end_offset > self.raw_storage.len() {
+            return Ok([0u8; BLOCK_SIZE]);
+        }
 
         let encrypted_packet = &self.raw_storage[start_offset..end_offset];
         let nonce = Nonce::from_slice(&encrypted_packet[0..12]);
         let ciphertext = &encrypted_packet[12..];
 
-        match self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }) {
+        match self.cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &[],
+            },
+        ) {
             Ok(plaintext) => {
                 let mut buffer = [0u8; BLOCK_SIZE];
                 buffer.copy_from_slice(&plaintext);
                 Ok(buffer)
             }
-            Err(_) => Ok([0u8; BLOCK_SIZE])
+            Err(_) => Ok([0u8; BLOCK_SIZE]),
         }
     }
 
@@ -293,8 +363,16 @@ impl BlockDevice for WebPDisk {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self.cipher.encrypt(nonce, Payload { msg: data, aad: &[] })
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: data,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
         let mut packet = Vec::with_capacity(ENCRYPTED_BLOCK_SIZE);
         packet.extend_from_slice(&nonce_bytes);
@@ -337,13 +415,16 @@ impl BlockDevice for WebPDisk {
         chunks.push(chunk);
 
         let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&self.path)?;
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)?;
 
-        self.webp_structure.clone().encoder().write_to(&mut file)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.webp_structure
+            .clone()
+            .encoder()
+            .write_to(&mut file)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.restore_times()
     }
 }

@@ -1,22 +1,22 @@
 // src/png_disk.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
-use std::io::{self, Result};
-use std::path::PathBuf;
-use std::fs::metadata;
-use filetime::{FileTime, set_file_times};
-use std::collections::HashSet;
-use image::RgbImage;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce
-};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use log::{info, debug, warn};
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
-    Argon2
+    Argon2,
 };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use filetime::{set_file_times, FileTime};
+use image::RgbImage;
+use log::{debug, info, warn};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use std::collections::HashSet;
+use std::fs::metadata;
+use std::io::{self, Result};
+use std::path::PathBuf;
 
 // 16 bytes (128 bits) for the Header/Salt.
 const SALT_BITS: usize = 128;
@@ -40,9 +40,15 @@ impl FeistelPermutator {
         let k3 = u32::from_le_bytes(key[12..16].try_into().unwrap());
 
         let mut bits = 32 - max_range.leading_zeros();
-        if bits % 2 != 0 { bits += 1; }
-        if (1 << bits) < max_range { bits += 2; }
-        if bits > 32 { bits = 32; }
+        if bits % 2 != 0 {
+            bits += 1;
+        }
+        if (1 << bits) < max_range {
+            bits += 2;
+        }
+        if bits > 32 {
+            bits = 32;
+        }
 
         let half_bits = bits / 2;
         let mask = (1 << half_bits) - 1;
@@ -106,15 +112,18 @@ impl PngDisk {
         let mtime = FileTime::from_last_modification_time(&meta);
 
         let mut img = image::open(&path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-        .to_rgb8();
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .to_rgb8();
 
         let width = img.width();
         let height = img.height();
         let total_channels = (width as usize) * (height as usize) * 3;
 
         if total_channels < SALT_BITS + 4096 {
-            return Err(io::Error::new(io::ErrorKind::Other, "Image too small for MirageFS"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Image too small for MirageFS",
+            ));
         }
 
         // 1. Locate Salt (Password Derived)
@@ -153,13 +162,16 @@ impl PngDisk {
         // 3. Derive Main Key
         debug!("Deriving main key...");
         let salt_string = SaltString::encode_b64(&salt)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         let mut key_buffer = [0u8; 32];
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
@@ -169,13 +181,25 @@ impl PngDisk {
         // 4. Initialize Permutator
         let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
 
-        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices, atime, mtime };
+        let disk = PngDisk {
+            img,
+            path,
+            cipher,
+            permutator,
+            salt_indices,
+            sorted_salt_indices,
+            atime,
+            mtime,
+        };
 
         // 5. Integrity Check
         if !format {
             if let Err(e) = disk.read_block(0) {
                 warn!("Block 0 Verify Failed: {}", e);
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed (Auth Tag Mismatch)"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Decryption Failed (Auth Tag Mismatch)",
+                ));
             }
         }
 
@@ -185,17 +209,31 @@ impl PngDisk {
         Ok(disk)
     }
 
-    pub fn from_image(path: PathBuf, mut img: RgbImage, password: &str, format: bool) -> io::Result<Self> {
+    pub fn from_image(
+        path: PathBuf,
+        mut img: RgbImage,
+        password: &str,
+        format: bool,
+    ) -> io::Result<Self> {
         let meta = metadata(&path).ok();
-        let atime = meta.as_ref().map(|m| FileTime::from_last_access_time(m)).unwrap_or_else(|| FileTime::from_unix_time(0, 0));
-        let mtime = meta.as_ref().map(|m| FileTime::from_last_modification_time(m)).unwrap_or_else(|| FileTime::from_unix_time(0, 0));
+        let atime = meta
+            .as_ref()
+            .map(|m| FileTime::from_last_access_time(m))
+            .unwrap_or_else(|| FileTime::from_unix_time(0, 0));
+        let mtime = meta
+            .as_ref()
+            .map(|m| FileTime::from_last_modification_time(m))
+            .unwrap_or_else(|| FileTime::from_unix_time(0, 0));
 
         let width = img.width();
         let height = img.height();
         let total_channels = (width as usize) * (height as usize) * 3;
 
         if total_channels < SALT_BITS + 4096 {
-            return Err(io::Error::new(io::ErrorKind::Other, "Image too small for MirageFS"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Image too small for MirageFS",
+            ));
         }
 
         debug!("Deriving salt locations (from_image)...");
@@ -231,10 +269,13 @@ impl PngDisk {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         let mut key_buffer = [0u8; 32];
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
@@ -243,12 +284,24 @@ impl PngDisk {
 
         let permutator = FeistelPermutator::new(&key_buffer, total_channels as u32);
 
-        let disk = PngDisk { img, path, cipher, permutator, salt_indices, sorted_salt_indices, atime, mtime };
+        let disk = PngDisk {
+            img,
+            path,
+            cipher,
+            permutator,
+            salt_indices,
+            sorted_salt_indices,
+            atime,
+            mtime,
+        };
 
         if !format {
             if let Err(e) = disk.read_block(0) {
                 warn!("Block 0 Verify Failed: {}", e);
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed (Auth Tag Mismatch)"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Decryption Failed (Auth Tag Mismatch)",
+                ));
             }
         }
 
@@ -276,11 +329,14 @@ impl PngDisk {
 
     fn derive_location_seed(password: &str) -> io::Result<[u8; 32]> {
         let salt_string = SaltString::encode_b64(LOCATION_SALT.as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let hash = argon2.hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let output = hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Loc Hash failed"))?;
+        let hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let output = hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Loc Hash failed"))?;
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&output.as_bytes()[0..32]);
         Ok(seed)
@@ -395,13 +451,22 @@ impl BlockDevice for PngDisk {
         let nonce = Nonce::from_slice(&encrypted_packet[0..12]);
         let ciphertext = &encrypted_packet[12..];
 
-        match self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }) {
+        match self.cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &[],
+            },
+        ) {
             Ok(plaintext) => {
                 let mut buffer = [0u8; BLOCK_SIZE];
                 buffer.copy_from_slice(&plaintext);
                 Ok(buffer)
             }
-            Err(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "Auth Tag Mismatch")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Auth Tag Mismatch",
+            )),
         }
     }
 
@@ -417,8 +482,16 @@ impl BlockDevice for PngDisk {
         rand::thread_rng().fill(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self.cipher.encrypt(nonce, Payload { msg: data, aad: &[] })
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: data,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
         let mut packet = Vec::with_capacity(ENCRYPTED_BLOCK_SIZE);
         packet.extend_from_slice(&nonce_bytes);
@@ -440,8 +513,9 @@ impl BlockDevice for PngDisk {
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.img.save(&self.path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.img
+            .save(&self.path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.restore_times()
     }
 }

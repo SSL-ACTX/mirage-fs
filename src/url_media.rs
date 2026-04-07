@@ -1,31 +1,31 @@
 // src/url_media.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
-use crate::png_disk::PngDisk;
 use crate::jpeg_disk::JpegDisk;
-use crate::webp_disk::WebPDisk;
 use crate::mp4_disk::Mp4Disk;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Error, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
-use std::time::Duration;
-use log::{info, warn, debug};
+use crate::png_disk::PngDisk;
+use crate::webp_disk::WebPDisk;
+use argon2::{
+    password_hash::{PasswordHasher, SaltString},
+    Argon2,
+};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use log::{debug, info, warn};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use reqwest::redirect::Policy;
 use reqwest::Url;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce
-};
-use argon2::{
-    password_hash::{PasswordHasher, SaltString},
-    Argon2
-};
 
 // ISO BMFF Constants
 const ATOM_MDAT: [u8; 4] = *b"mdat";
@@ -53,8 +53,8 @@ enum MediaKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{Rgb, RgbImage};
     use tempfile::tempdir;
-    use image::{RgbImage, Rgb};
 
     #[test]
     fn detect_png_file() {
@@ -148,7 +148,8 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
     // file:// URLs map directly to local read-only carriers.
     if let Ok(parsed) = Url::parse(url) {
         if parsed.scheme() == "file" {
-            let path = parsed.to_file_path()
+            let path = parsed
+                .to_file_path()
                 .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", url))?;
             return open_local_readonly(path, password);
         }
@@ -192,13 +193,19 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
 
             // Detect from bytes first
             let file_kind = detect_media_kind_from_bytes(&buf).or(initial_hint);
-            let chosen = file_kind.ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
+            let chosen = file_kind.ok_or_else(|| {
+                anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url)
+            })?;
 
             let disk: Box<dyn BlockDevice> = match chosen {
                 MediaKind::Png => {
                     // Try building PngDisk from in-memory bytes (decode to image in-memory)
                     if let Ok(img) = image::load_from_memory(&buf) {
-                        Box::new(PngDisk::from_image_pathless(img.to_rgb8(), password, false)?)
+                        Box::new(PngDisk::from_image_pathless(
+                            img.to_rgb8(),
+                            password,
+                            false,
+                        )?)
                     } else {
                         anyhow::bail!("Failed to decode PNG from remote bytes");
                     }
@@ -221,7 +228,9 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
             let temp_dir = tempfile::TempDir::new()?;
             let file_path = temp_dir.path().join("mirage_media");
             download_to_file(&client, &head_info.final_url, &file_path)?;
-            let file_kind = detect_media_kind_from_file(&file_path).ok_or_else(|| anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url))?;
+            let file_kind = detect_media_kind_from_file(&file_path).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported or unknown media type for URL: {}", url)
+            })?;
             let disk: Box<dyn BlockDevice> = match file_kind {
                 MediaKind::Png => Box::new(PngDisk::new(file_path, password, false)?),
                 MediaKind::Jpeg => Box::new(JpegDisk::new(file_path, password, false)?),
@@ -247,33 +256,45 @@ fn fetch_head_info(client: &Client, url: &str) -> HeadInfo {
     if let Ok(res) = client.head(url).send() {
         final_url = res.url().to_string();
         if res.status().is_success() {
-            content_type = res.headers()
+            content_type = res
+                .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            content_length = res.headers()
+            content_length = res
+                .headers()
                 .get(CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            return HeadInfo { content_type, content_length, final_url };
+            return HeadInfo {
+                content_type,
+                content_length,
+                final_url,
+            };
         }
     }
 
     if let Ok(res) = client.get(url).header(RANGE, "bytes=0-0").send() {
         final_url = res.url().to_string();
         if res.status().is_success() || res.status().as_u16() == 206 {
-            content_type = res.headers()
+            content_type = res
+                .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            content_length = res.headers()
+            content_length = res
+                .headers()
                 .get(CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
         }
     }
 
-    HeadInfo { content_type, content_length, final_url }
+    HeadInfo {
+        content_type,
+        content_length,
+        final_url,
+    }
 }
 
 fn detect_media_kind(url: &str, content_type: Option<&str>) -> Option<MediaKind> {
@@ -283,12 +304,24 @@ fn detect_media_kind(url: &str, content_type: Option<&str>) -> Option<MediaKind>
 
     if let Some(ct) = content_type {
         let ct = ct.to_ascii_lowercase();
-        if ct.contains("image/png") { return Some(MediaKind::Png); }
-        if ct.contains("image/jpeg") { return Some(MediaKind::Jpeg); }
-        if ct.contains("image/jpg") { return Some(MediaKind::Jpeg); }
-        if ct.contains("image/webp") { return Some(MediaKind::Webp); }
-        if ct.contains("video/mp4") { return Some(MediaKind::Mp4); }
-        if ct.contains("video/quicktime") { return Some(MediaKind::Mp4); }
+        if ct.contains("image/png") {
+            return Some(MediaKind::Png);
+        }
+        if ct.contains("image/jpeg") {
+            return Some(MediaKind::Jpeg);
+        }
+        if ct.contains("image/jpg") {
+            return Some(MediaKind::Jpeg);
+        }
+        if ct.contains("image/webp") {
+            return Some(MediaKind::Webp);
+        }
+        if ct.contains("video/mp4") {
+            return Some(MediaKind::Mp4);
+        }
+        if ct.contains("video/quicktime") {
+            return Some(MediaKind::Mp4);
+        }
     }
     None
 }
@@ -349,7 +382,8 @@ fn detect_media_kind_from_url(url: &str) -> Option<MediaKind> {
 }
 
 fn open_local_readonly(path: PathBuf, password: &str) -> anyhow::Result<Box<dyn BlockDevice>> {
-    let extension = path.extension()
+    let extension = path
+        .extension()
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_else(|| "unknown".to_string());
@@ -380,24 +414,33 @@ fn download_to_file(client: &Client, url: &str, path: &Path) -> anyhow::Result<(
     let resolved = resolve_media_url(client, url, 8)?;
     info!("Downloading remote media to local cache: {}", resolved);
     let mut resp = client.get(&resolved).send()?.error_for_status()?;
-    let content_type = resp.headers()
+    let content_type = resp
+        .headers()
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_ascii_lowercase());
     let max_bytes = max_download_bytes();
-    if let Some(len) = resp.headers()
+    if let Some(len) = resp
+        .headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
     {
         if len > max_bytes {
-            anyhow::bail!("Remote media is too large ({} bytes > max {} bytes)", len, max_bytes);
+            anyhow::bail!(
+                "Remote media is too large ({} bytes > max {} bytes)",
+                len,
+                max_bytes
+            );
         }
     }
 
     if let Some(ct) = content_type.as_deref() {
         if ct.contains("text/html") || ct.contains("application/xhtml") {
-            anyhow::bail!("Remote response was HTML, not media. Final URL: {}", resp.url());
+            anyhow::bail!(
+                "Remote response was HTML, not media. Final URL: {}",
+                resp.url()
+            );
         }
     }
 
@@ -406,10 +449,16 @@ fn download_to_file(client: &Client, url: &str, path: &Path) -> anyhow::Result<(
     let mut total = 0u64;
     loop {
         let read = resp.read(&mut buffer)?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         total = total.saturating_add(read as u64);
         if total > max_bytes {
-            anyhow::bail!("Remote media exceeded max size ({} bytes > max {} bytes)", total, max_bytes);
+            anyhow::bail!(
+                "Remote media exceeded max size ({} bytes > max {} bytes)",
+                total,
+                max_bytes
+            );
         }
         out.write_all(&buffer[..read])?;
     }
@@ -427,9 +476,7 @@ fn resolve_media_url(client: &Client, start_url: &str, max_hops: usize) -> anyho
             anyhow::bail!("URL resolution loop detected for {}", current);
         }
 
-        let resp = client.get(&current)
-            .header(RANGE, "bytes=0-2047")
-            .send();
+        let resp = client.get(&current).header(RANGE, "bytes=0-2047").send();
 
         let mut resp = match resp {
             Ok(r) => r,
@@ -437,7 +484,8 @@ fn resolve_media_url(client: &Client, start_url: &str, max_hops: usize) -> anyho
         };
 
         let final_url = resp.url().to_string();
-        let content_type = resp.headers()
+        let content_type = resp
+            .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_ascii_lowercase());
@@ -469,17 +517,25 @@ fn resolve_media_url(client: &Client, start_url: &str, max_hops: usize) -> anyho
             .filter(|c| c != &current)
             .collect::<Vec<_>>();
         if candidates.is_empty() {
-            anyhow::bail!("Unable to resolve media URL from HTML content at {}", final_url);
+            anyhow::bail!(
+                "Unable to resolve media URL from HTML content at {}",
+                final_url
+            );
         }
 
         score_candidates(&mut candidates, target_name.as_deref());
-        let resolved = pick_best_candidate(client, &candidates, base.as_ref(), target_name.as_deref())?;
+        let resolved =
+            pick_best_candidate(client, &candidates, base.as_ref(), target_name.as_deref())?;
         info!("Following HTML redirect to: {}", resolved);
         current = resolved;
         continue;
     }
 
-    anyhow::bail!("URL resolution exceeded {} hops for {}", max_hops, start_url);
+    anyhow::bail!(
+        "URL resolution exceeded {} hops for {}",
+        max_hops,
+        start_url
+    );
 }
 
 fn extract_url_candidates(html: &str) -> Vec<String> {
@@ -546,7 +602,8 @@ fn looks_like_media(buf: &[u8]) -> bool {
 }
 
 fn score_candidates(candidates: &mut Vec<String>, target_name: Option<&str>) {
-    candidates.sort_by(|a, b| score_candidate(b, target_name).cmp(&score_candidate(a, target_name)));
+    candidates
+        .sort_by(|a, b| score_candidate(b, target_name).cmp(&score_candidate(a, target_name)));
 }
 
 fn score_candidate(url: &str, target_name: Option<&str>) -> i32 {
@@ -567,19 +624,34 @@ fn score_candidate(url: &str, target_name: Option<&str>) -> i32 {
         score += 15;
     }
 
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png") || lower.ends_with(".webp") || lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".m4v") {
+    if lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".mp4")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".m4v")
+    {
         score += 10;
     }
 
     score
 }
 
-fn pick_best_candidate(client: &Client, candidates: &[String], base: Option<&Url>, target_name: Option<&str>) -> anyhow::Result<String> {
+fn pick_best_candidate(
+    client: &Client,
+    candidates: &[String],
+    base: Option<&Url>,
+    target_name: Option<&str>,
+) -> anyhow::Result<String> {
     let mut tried = 0;
     for candidate in candidates.iter().take(12) {
         let url = normalize_url(candidate, base)?;
         if let Some(name) = target_name {
-            if !url.to_ascii_lowercase().contains(&name.to_ascii_lowercase()) {
+            if !url
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+            {
                 if tried < 3 {
                     // still probe a few even without name match
                 } else {
@@ -607,7 +679,8 @@ fn pick_best_candidate(client: &Client, candidates: &[String], base: Option<&Url
 fn probe_media_url(client: &Client, url: &str) -> io::Result<bool> {
     let resp = client.head(url).send();
     if let Ok(res) = resp {
-        let ct = res.headers()
+        let ct = res
+            .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_ascii_lowercase());
@@ -615,18 +688,20 @@ fn probe_media_url(client: &Client, url: &str) -> io::Result<bool> {
             if ct.contains("text/html") || ct.contains("application/xhtml") {
                 return Ok(false);
             }
-            if ct.contains("image/") || ct.contains("video/") || ct.contains("application/octet-stream") {
+            if ct.contains("image/")
+                || ct.contains("video/")
+                || ct.contains("application/octet-stream")
+            {
                 return Ok(true);
             }
         }
     }
 
-    let res = client.get(url)
-        .header(RANGE, "bytes=0-0")
-        .send();
+    let res = client.get(url).header(RANGE, "bytes=0-0").send();
 
     if let Ok(res) = res {
-        let ct = res.headers()
+        let ct = res
+            .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_ascii_lowercase());
@@ -634,7 +709,10 @@ fn probe_media_url(client: &Client, url: &str) -> io::Result<bool> {
             if ct.contains("text/html") || ct.contains("application/xhtml") {
                 return Ok(false);
             }
-            if ct.contains("image/") || ct.contains("video/") || ct.contains("application/octet-stream") {
+            if ct.contains("image/")
+                || ct.contains("video/")
+                || ct.contains("application/octet-stream")
+            {
                 return Ok(true);
             }
         }
@@ -646,25 +724,40 @@ fn probe_media_url(client: &Client, url: &str) -> io::Result<bool> {
 fn extract_filename(url: &str) -> Option<String> {
     let url_no_query = url.split('?').next().unwrap_or(url);
     let name = url_no_query.rsplit('/').next().unwrap_or("").trim();
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn read_until_delim(s: &str) -> Option<String> {
-    let end = s.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>')
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>')
         .unwrap_or(s.len());
     let candidate = s[..end].trim();
-    if candidate.is_empty() { None } else { Some(candidate.to_string()) }
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
 }
 
 fn read_quoted_or_plain(s: &str) -> Option<String> {
     let s = s.trim_start();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     let first = s.chars().next()?;
     if first == '"' || first == '\'' {
         let rest = &s[1..];
         let end = rest.find(first).unwrap_or(rest.len());
         let candidate = &rest[..end];
-        if candidate.is_empty() { None } else { Some(candidate.to_string()) }
+        if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate.to_string())
+        }
     } else {
         read_until_delim(s)
     }
@@ -707,7 +800,7 @@ fn prefetch_enabled() -> bool {
     std::env::var("MIRAGE_URL_PREFETCH")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    .unwrap_or(false)
+        .unwrap_or(false)
 }
 
 fn disk_cache_max_bytes() -> u64 {
@@ -739,15 +832,25 @@ fn try_curl_like_resolution(start: &str) -> anyhow::Result<Option<String>> {
     if let Ok(resp) = client.head(start).send() {
         if resp.status().is_success() {
             let final_url = resp.url().to_string();
-            if let Some(ct) = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+            if let Some(ct) = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
                 let ct = ct.to_ascii_lowercase();
-                if ct.contains("image/") || ct.contains("video/") || ct.contains("application/octet-stream") {
+                if ct.contains("image/")
+                    || ct.contains("video/")
+                    || ct.contains("application/octet-stream")
+                {
                     return Ok(Some(final_url));
                 }
             }
             // If Location header present and pointing to an S3/signed URL, prefer it
             if let Some(loc) = resp.headers().get("Location").and_then(|v| v.to_str().ok()) {
-                if loc.contains("s3.filebin.net") || loc.contains("amazonaws.com") || loc.contains("x-amz-signature") {
+                if loc.contains("s3.filebin.net")
+                    || loc.contains("amazonaws.com")
+                    || loc.contains("x-amz-signature")
+                {
                     return Ok(Some(loc.to_string()));
                 }
             }
@@ -776,23 +879,38 @@ struct ReadOnlyDevice {
 
 impl ReadOnlyDevice {
     fn new(inner: Box<dyn BlockDevice>, temp_dir: Option<TempDir>) -> Self {
-        Self { inner, _temp_dir: temp_dir }
+        Self {
+            inner,
+            _temp_dir: temp_dir,
+        }
     }
 }
 
 impl BlockDevice for ReadOnlyDevice {
-    fn block_count(&self) -> u64 { self.inner.block_count() }
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
     fn read_block(&self, index: u32) -> io::Result<[u8; BLOCK_SIZE]> {
         self.inner.read_block(index)
     }
     fn write_block(&mut self, _index: u32, _data: &[u8; BLOCK_SIZE]) -> io::Result<()> {
-        Err(Error::new(ErrorKind::PermissionDenied, "Read-only media URL"))
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Read-only media URL",
+        ))
     }
     fn resize(&mut self, _block_count: u64) -> io::Result<()> {
-        Err(Error::new(ErrorKind::PermissionDenied, "Read-only media URL"))
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Read-only media URL",
+        ))
     }
-    fn sync(&mut self) -> io::Result<()> { Ok(()) }
-    fn is_expandable(&self) -> bool { self.inner.is_expandable() }
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn is_expandable(&self) -> bool {
+        self.inner.is_expandable()
+    }
 }
 
 struct HttpRangeReader {
@@ -884,24 +1002,30 @@ impl DiskCache {
             }
         }
     }
-
 }
 
 impl HttpRangeReader {
-    fn new(client: Client, origin_url: String, url: String, content_length: Option<u64>) -> io::Result<Self> {
+    fn new(
+        client: Client,
+        origin_url: String,
+        url: String,
+        content_length: Option<u64>,
+    ) -> io::Result<Self> {
         let mut content_len = content_length;
         let mut accept_ranges = false;
 
         if let Ok(res) = client.head(&url).send() {
             if res.status().is_success() {
-                accept_ranges = res.headers()
+                accept_ranges = res
+                    .headers()
                     .get(ACCEPT_RANGES)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_ascii_lowercase().contains("bytes"))
                     .unwrap_or(false);
 
                 if content_len.is_none() {
-                    content_len = res.headers()
+                    content_len = res
+                        .headers()
                         .get(CONTENT_LENGTH)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
@@ -916,10 +1040,18 @@ impl HttpRangeReader {
         }
 
         if !accept_ranges {
-            return Err(Error::new(ErrorKind::Unsupported, "Remote server does not support byte ranges"));
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Remote server does not support byte ranges",
+            ));
         }
 
-        let content_length = content_len.ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing content length for remote media"))?;
+        let content_length = content_len.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Missing content length for remote media",
+            )
+        })?;
 
         let disk_cache = init_disk_cache();
 
@@ -956,15 +1088,17 @@ impl HttpRangeReader {
 
         UrlMetrics::miss_cache(len as u64);
 
-        let mut content_length = *self.content_length.lock().map_err(|_| {
-            Error::new(ErrorKind::Other, "Range reader poisoned")
-        })?;
+        let mut content_length = *self
+            .content_length
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
         if offset >= content_length {
             // Attempt refresh in case a signed URL expired or length changed.
             if self.refresh_url().is_ok() {
-                content_length = *self.content_length.lock().map_err(|_| {
-                    Error::new(ErrorKind::Other, "Range reader poisoned")
-                })?;
+                content_length = *self
+                    .content_length
+                    .lock()
+                    .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
             }
             if offset >= content_length {
                 return Err(Error::new(ErrorKind::UnexpectedEof, "Offset beyond EOF"));
@@ -977,7 +1111,11 @@ impl HttpRangeReader {
         let expected_len = (end - offset + 1) as usize;
         let range_header = format!("bytes={}-{}", offset, end);
 
-        let url = self.url.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?.clone();
+        let url = self
+            .url
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?
+            .clone();
         match self.try_read_range(&url, &range_header, expected_len) {
             Ok(buf) => {
                 self.update_cache(offset, buf.clone());
@@ -990,8 +1128,13 @@ impl HttpRangeReader {
             Err(e) => {
                 // Attempt a refresh (e.g., signed URL expired) and retry once.
                 if self.refresh_url().is_ok() {
-                    let refreshed_url = self.url.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?.clone();
-                    return self.try_read_range(&refreshed_url, &range_header, expected_len)
+                    let refreshed_url = self
+                        .url
+                        .lock()
+                        .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?
+                        .clone();
+                    return self
+                        .try_read_range(&refreshed_url, &range_header, expected_len)
                         .map(|buf| {
                             self.update_cache(offset, buf.clone());
                             self.update_disk_cache(offset, buf.clone());
@@ -1024,7 +1167,10 @@ impl HttpRangeReader {
 
     fn update_cache(&self, offset: u64, data: Vec<u8>) {
         if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some(RangeCache { start: offset, data });
+            *cache = Some(RangeCache {
+                start: offset,
+                data,
+            });
         }
     }
 
@@ -1078,16 +1224,21 @@ impl HttpRangeReader {
     }
 
     fn prefetch_range(&self, offset: u64, len: usize) -> io::Result<()> {
-        let content_length = *self.content_length.lock().map_err(|_| {
-            Error::new(ErrorKind::Other, "Range reader poisoned")
-        })?;
+        let content_length = *self
+            .content_length
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
         if offset >= content_length {
             return Ok(());
         }
         let end = std::cmp::min(offset + len as u64 - 1, content_length - 1);
         let expected_len = (end - offset + 1) as usize;
         let range_header = format!("bytes={}-{}", offset, end);
-        let url = self.url.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?.clone();
+        let url = self
+            .url
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?
+            .clone();
         if let Ok(buf) = self.try_read_range(&url, &range_header, expected_len) {
             self.update_cache(offset, buf.clone());
             self.update_disk_cache(offset, buf);
@@ -1100,7 +1251,12 @@ impl HttpRangeReader {
             client: self.client.clone(),
             origin_url: self.origin_url.clone(),
             url: Mutex::new(self.url.lock().unwrap_or_else(|p| p.into_inner()).clone()),
-            content_length: Mutex::new(*self.content_length.lock().unwrap_or_else(|p| p.into_inner())),
+            content_length: Mutex::new(
+                *self
+                    .content_length
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            ),
             cache: Arc::clone(&self.cache),
             disk_cache: Arc::clone(&self.disk_cache),
             last_read: Arc::clone(&self.last_read),
@@ -1109,9 +1265,16 @@ impl HttpRangeReader {
         }
     }
 
-    fn try_read_range(&self, url: &str, range_header: &str, expected_len: usize) -> io::Result<Vec<u8>> {
+    fn try_read_range(
+        &self,
+        url: &str,
+        range_header: &str,
+        expected_len: usize,
+    ) -> io::Result<Vec<u8>> {
         let start = Instant::now();
-        let mut resp = self.client.get(url)
+        let mut resp = self
+            .client
+            .get(url)
             .header(RANGE, range_header)
             .send()
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
@@ -1127,7 +1290,8 @@ impl HttpRangeReader {
         }
 
         // Update content length from Content-Range if present.
-        if let Some(total) = resp.headers()
+        if let Some(total) = resp
+            .headers()
             .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range_total)
@@ -1140,7 +1304,10 @@ impl HttpRangeReader {
         let mut buf = Vec::with_capacity(expected_len);
         resp.read_to_end(&mut buf)?;
         if buf.len() != expected_len {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Short read from remote media"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Short read from remote media",
+            ));
         }
         Ok(buf)
     }
@@ -1149,22 +1316,37 @@ impl HttpRangeReader {
         let resolved = resolve_media_url(&self.client, &self.origin_url, 8)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         let head = fetch_head_info(&self.client, &resolved);
-        let length = head.content_length.ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing content length for remote media"))?;
+        let length = head.content_length.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Missing content length for remote media",
+            )
+        })?;
 
-        let mut url_lock = self.url.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
-        let mut len_lock = self.content_length.lock().map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
+        let mut url_lock = self
+            .url
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
+        let mut len_lock = self
+            .content_length
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "Range reader poisoned"))?;
         *url_lock = head.final_url;
         *len_lock = length;
         Ok(())
     }
 
     fn len(&self) -> u64 {
-        *self.content_length.lock().unwrap_or_else(|p| p.into_inner())
+        *self
+            .content_length
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 }
 
 fn probe_range(client: &Client, url: &str) -> io::Result<(u64, bool)> {
-    let mut resp = client.get(url)
+    let mut resp = client
+        .get(url)
         .header(RANGE, "bytes=0-0")
         .send()
         .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
@@ -1174,11 +1356,17 @@ fn probe_range(client: &Client, url: &str) -> io::Result<(u64, bool)> {
         return Ok((0, false));
     }
 
-    let total = resp.headers()
+    let total = resp
+        .headers()
         .get(CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range_total)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing Content-Range in range response"))?;
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Missing Content-Range in range response",
+            )
+        })?;
 
     let mut buf = Vec::new();
     let _ = resp.read_to_end(&mut buf);
@@ -1189,7 +1377,9 @@ fn probe_range(client: &Client, url: &str) -> io::Result<(u64, bool)> {
 fn parse_content_range_total(value: &str) -> Option<u64> {
     // Example: "bytes 0-0/12345"
     let total = value.split('/').nth(1)?;
-    if total == "*" { return None; }
+    if total == "*" {
+        return None;
+    }
     total.parse::<u64>().ok()
 }
 
@@ -1204,7 +1394,10 @@ impl UrlMp4Disk {
     fn new(reader: HttpRangeReader, password: &str) -> io::Result<Self> {
         let (mdat_offset, mdat_size, exists) = Self::scan_for_mirage_mdat(&reader)?;
         if !exists {
-            return Err(Error::new(ErrorKind::InvalidData, "No MirageFS (Shadow mdat) found in MP4 URL"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "No MirageFS (Shadow mdat) found in MP4 URL",
+            ));
         }
 
         let data_start = mdat_offset + 8;
@@ -1214,13 +1407,22 @@ impl UrlMp4Disk {
         let first_len = NAL_OVERHEAD + MIRAGE_MAGIC.len() + SALT_SIZE;
         let first_nal = reader.read_range(data_start, first_len)?;
 
-        if first_nal.len() < first_len || first_nal[0..4] != NAL_PREFIX || first_nal[4] != NAL_FILLER_TYPE {
-            return Err(Error::new(ErrorKind::InvalidData, "Corrupt NAL encapsulation"));
+        if first_nal.len() < first_len
+            || first_nal[0..4] != NAL_PREFIX
+            || first_nal[4] != NAL_FILLER_TYPE
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Corrupt NAL encapsulation",
+            ));
         }
 
         let payload_start = NAL_OVERHEAD;
         if &first_nal[payload_start..payload_start + 8] != MIRAGE_MAGIC {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid Magic in Shadow mdat"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid Magic in Shadow mdat",
+            ));
         }
 
         let salt = &first_nal[payload_start + 8..payload_start + 8 + SALT_SIZE];
@@ -1229,10 +1431,13 @@ impl UrlMp4Disk {
         let salt_string = SaltString::encode_b64(salt)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
-        let hash_output = password_hash.hash.ok_or_else(|| Error::new(ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or_else(|| Error::new(ErrorKind::Other, "Hash failed"))?;
         let mut key_buffer = [0u8; 32];
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
@@ -1253,7 +1458,9 @@ impl UrlMp4Disk {
 
         while pos < len {
             let header = reader.read_range(pos, 8)?;
-            if header.len() < 8 { break; }
+            if header.len() < 8 {
+                break;
+            }
 
             let mut size = u32::from_be_bytes(header[0..4].try_into().unwrap()) as u64;
             let type_bytes = &header[4..8];
@@ -1261,7 +1468,9 @@ impl UrlMp4Disk {
 
             if size == 1 {
                 let ext = reader.read_range(pos + 8, 8)?;
-                if ext.len() < 8 { break; }
+                if ext.len() < 8 {
+                    break;
+                }
                 size = u64::from_be_bytes(ext[0..8].try_into().unwrap());
                 header_len = 16;
             } else if size == 0 {
@@ -1284,7 +1493,9 @@ impl UrlMp4Disk {
                 }
             }
 
-            if size == 0 { break; }
+            if size == 0 {
+                break;
+            }
             pos += size;
         }
 
@@ -1293,17 +1504,23 @@ impl UrlMp4Disk {
 }
 
 impl BlockDevice for UrlMp4Disk {
-    fn is_expandable(&self) -> bool { true }
+    fn is_expandable(&self) -> bool {
+        true
+    }
 
     fn block_count(&self) -> u64 {
         let header_nal_len = NAL_OVERHEAD + MIRAGE_MAGIC.len() + SALT_SIZE;
-        if self.data_length <= header_nal_len as u64 { return 0; }
+        if self.data_length <= header_nal_len as u64 {
+            return 0;
+        }
         (self.data_length - header_nal_len as u64) / NAL_PACKET_SIZE as u64
     }
 
     fn read_block(&self, index: u32) -> io::Result<[u8; BLOCK_SIZE]> {
         let header_nal_len = NAL_OVERHEAD + MIRAGE_MAGIC.len() + SALT_SIZE;
-        let offset = self.data_start_offset + header_nal_len as u64 + (index as u64 * NAL_PACKET_SIZE as u64);
+        let offset = self.data_start_offset
+            + header_nal_len as u64
+            + (index as u64 * NAL_PACKET_SIZE as u64);
 
         if offset + NAL_PACKET_SIZE as u64 > self.data_start_offset + self.data_length {
             return Ok([0u8; BLOCK_SIZE]);
@@ -1311,19 +1528,31 @@ impl BlockDevice for UrlMp4Disk {
 
         let packet = self.reader.read_range(offset, NAL_PACKET_SIZE)?;
         if packet.len() != NAL_PACKET_SIZE {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Short read from remote MP4"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Short read from remote MP4",
+            ));
         }
 
         if packet[0..4] != NAL_PREFIX || packet[4] != NAL_FILLER_TYPE {
             warn!("MP4 URL: Bad NAL wrapper at block {}", index);
-            return Err(Error::new(ErrorKind::InvalidData, "Stream Synchronization Lost"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Stream Synchronization Lost",
+            ));
         }
 
         let encrypted_data = &packet[NAL_OVERHEAD..];
         let nonce = Nonce::from_slice(&encrypted_data[0..12]);
         let ciphertext = &encrypted_data[12..];
 
-        match self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }) {
+        match self.cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &[],
+            },
+        ) {
             Ok(plaintext) => {
                 let mut buffer = [0u8; BLOCK_SIZE];
                 buffer.copy_from_slice(&plaintext);
@@ -1337,12 +1566,20 @@ impl BlockDevice for UrlMp4Disk {
     }
 
     fn write_block(&mut self, _index: u32, _data: &[u8; BLOCK_SIZE]) -> io::Result<()> {
-        Err(Error::new(ErrorKind::PermissionDenied, "Read-only media URL"))
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Read-only media URL",
+        ))
     }
 
     fn resize(&mut self, _block_count: u64) -> io::Result<()> {
-        Err(Error::new(ErrorKind::PermissionDenied, "Read-only media URL"))
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Read-only media URL",
+        ))
     }
 
-    fn sync(&mut self) -> io::Result<()> { Ok(()) }
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }

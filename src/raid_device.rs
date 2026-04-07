@@ -1,9 +1,9 @@
 // src/raid_device.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE};
-use std::io::{Result, Error, ErrorKind};
-use log::{info, debug};
-use serde::{Serialize, Deserialize};
-use rand::{RngCore, thread_rng};
+use log::{debug, info};
+use rand::{thread_rng, RngCore};
+use serde::{Deserialize, Serialize};
+use std::io::{Error, ErrorKind, Result};
 
 const RAID_MAGIC: &[u8; 8] = b"MIRAGEFS";
 
@@ -28,7 +28,10 @@ pub struct Raid0Device {
 impl Raid0Device {
     pub fn new(mut devices: Vec<Box<dyn BlockDevice>>, format: bool) -> Result<Self> {
         if devices.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidInput, "RAID0 requires at least 1 device"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "RAID0 requires at least 1 device",
+            ));
         }
         let count = devices.len() as u32;
 
@@ -46,7 +49,7 @@ impl Raid0Device {
                 };
 
                 let encoded = bincode::serialize(&metadata)
-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
                 let mut block = [0u8; BLOCK_SIZE];
                 if encoded.len() > BLOCK_SIZE {
@@ -63,27 +66,52 @@ impl Raid0Device {
 
             for (i, device) in devices.iter().enumerate() {
                 let block = device.read_block(0)?;
-                let metadata: RaidMetadata = bincode::deserialize(&block)
-                .map_err(|_| Error::new(ErrorKind::InvalidData, format!("Device {}: Invalid Header (Not a MirageFS volume?)", i)))?;
+                let metadata: RaidMetadata = bincode::deserialize(&block).map_err(|_| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Device {}: Invalid Header (Not a MirageFS volume?)", i),
+                    )
+                })?;
 
                 if &metadata.magic != RAID_MAGIC {
-                    return Err(Error::new(ErrorKind::InvalidData, format!("Device {}: Bad Magic Signature", i)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Device {}: Bad Magic Signature", i),
+                    ));
                 }
                 if let Some(id) = expected_id {
                     if metadata.array_id != id {
-                        return Err(Error::new(ErrorKind::InvalidData, format!("Device {}: UUID Mismatch!", i)));
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("Device {}: UUID Mismatch!", i),
+                        ));
                     }
                 } else {
                     expected_id = Some(metadata.array_id);
                 }
                 if metadata.device_count != count {
-                    return Err(Error::new(ErrorKind::InvalidData, format!("Device {}: Expects {} devices, but {} were provided.", i, metadata.device_count, count)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Device {}: Expects {} devices, but {} were provided.",
+                            i, metadata.device_count, count
+                        ),
+                    ));
                 }
                 if metadata.device_index != i as u32 {
-                    return Err(Error::new(ErrorKind::InvalidData, format!("Order Error: Device {} at position {}.", i, metadata.device_index)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "Order Error: Device {} at position {}.",
+                            i, metadata.device_index
+                        ),
+                    ));
                 }
             }
-            info!("RAID0: Integrity Check Passed. Array UUID: {}", hex::encode(expected_id.unwrap()));
+            info!(
+                "RAID0: Integrity Check Passed. Array UUID: {}",
+                hex::encode(expected_id.unwrap())
+            );
         }
 
         // Calculate Zones for Hybrid RAID
@@ -110,20 +138,26 @@ impl Raid0Device {
 
         info!("RAID0: Hybrid Tiering Active.");
         if has_static {
-            info!("  -> Zone 1 (High-Stealth): Striped across {} devices (Limit: {} blocks/dev)", count, min_static_cap);
+            info!(
+                "  -> Zone 1 (High-Stealth): Striped across {} devices (Limit: {} blocks/dev)",
+                count, min_static_cap
+            );
         } else {
             info!("  -> Zone 1 (High-Stealth): Unlimited Stripe (All devices dynamic).");
         }
 
         if !expandable_indices.is_empty() && has_static {
-            info!("  -> Zone 2 (Overflow): Spilling over to {} dynamic device(s).", expandable_indices.len());
+            info!(
+                "  -> Zone 2 (Overflow): Spilling over to {} dynamic device(s).",
+                expandable_indices.len()
+            );
         }
 
         Ok(Self {
             devices,
             total_devices: count as u64,
             zone1_limit_per_device: min_static_cap,
-            expandable_indices
+            expandable_indices,
         })
     }
 }
@@ -134,7 +168,8 @@ impl BlockDevice for Raid0Device {
         let zone1_total = if self.zone1_limit_per_device == u64::MAX {
             u64::MAX / 2
         } else {
-            self.zone1_limit_per_device.saturating_mul(self.total_devices)
+            self.zone1_limit_per_device
+                .saturating_mul(self.total_devices)
         };
 
         if self.expandable_indices.is_empty() {
@@ -146,7 +181,9 @@ impl BlockDevice for Raid0Device {
 
     fn read_block(&self, index: u32) -> Result<[u8; BLOCK_SIZE]> {
         let index_u64 = index as u64;
-        let zone1_boundary = self.zone1_limit_per_device.saturating_mul(self.total_devices);
+        let zone1_boundary = self
+            .zone1_limit_per_device
+            .saturating_mul(self.total_devices);
 
         if index_u64 < zone1_boundary {
             // Zone 1
@@ -164,9 +201,7 @@ impl BlockDevice for Raid0Device {
             let map_idx = (overflow_idx % width) as usize;
             let real_device_idx = self.expandable_indices[map_idx];
 
-            let local_idx = self.zone1_limit_per_device
-            + (overflow_idx / width)
-            + 1;
+            let local_idx = self.zone1_limit_per_device + (overflow_idx / width) + 1;
 
             self.devices[real_device_idx].read_block(local_idx as u32)
         }
@@ -174,7 +209,9 @@ impl BlockDevice for Raid0Device {
 
     fn write_block(&mut self, index: u32, data: &[u8; BLOCK_SIZE]) -> Result<()> {
         let index_u64 = index as u64;
-        let zone1_boundary = self.zone1_limit_per_device.saturating_mul(self.total_devices);
+        let zone1_boundary = self
+            .zone1_limit_per_device
+            .saturating_mul(self.total_devices);
 
         if index_u64 < zone1_boundary {
             let device_idx = (index_u64 % self.total_devices) as usize;
@@ -182,7 +219,10 @@ impl BlockDevice for Raid0Device {
             self.devices[device_idx].write_block(local_idx + 1, data)
         } else {
             if self.expandable_indices.is_empty() {
-                return Err(Error::new(ErrorKind::Other, "Disk Full (No expandable carriers)"));
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Disk Full (No expandable carriers)",
+                ));
             }
             let overflow_idx = index_u64 - zone1_boundary;
             let width = self.expandable_indices.len() as u64;
@@ -190,16 +230,16 @@ impl BlockDevice for Raid0Device {
             let map_idx = (overflow_idx % width) as usize;
             let real_device_idx = self.expandable_indices[map_idx];
 
-            let local_idx = self.zone1_limit_per_device
-            + (overflow_idx / width)
-            + 1;
+            let local_idx = self.zone1_limit_per_device + (overflow_idx / width) + 1;
 
             self.devices[real_device_idx].write_block(local_idx as u32, data)
         }
     }
 
     fn resize(&mut self, block_count: u64) -> Result<()> {
-        let zone1_boundary = self.zone1_limit_per_device.saturating_mul(self.total_devices);
+        let zone1_boundary = self
+            .zone1_limit_per_device
+            .saturating_mul(self.total_devices);
 
         if block_count > zone1_boundary {
             // Case A: New size is still inside Zone 2 (Overflow)
@@ -218,7 +258,6 @@ impl BlockDevice for Raid0Device {
             for &idx in &self.expandable_indices {
                 self.devices[idx].resize(new_size)?;
             }
-
         } else {
             // Case B: New size has shrunk back into Zone 1 (Standard Stripe)
             // We must shrink dynamic devices to match the standard stripe height.

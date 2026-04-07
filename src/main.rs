@@ -1,39 +1,45 @@
 // src/main.rs
-use clap::{Parser, ArgAction};
-use log::{info, error, warn, LevelFilter};
-use std::path::PathBuf;
-use std::io::{self, Write};
-use std::process::Command;
+use clap::{ArgAction, Parser};
 use env_logger::Builder;
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "fuse", unix))]
 use fuser::MountOption;
-#[cfg(feature = "fuse")]
+use log::{error, info, LevelFilter};
+#[cfg(all(feature = "fuse", unix))]
+use log::warn;
+#[cfg(all(feature = "fuse", unix))]
 use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+#[cfg(all(feature = "fuse", unix))]
+use std::process::Command;
 
 mod block_device;
-mod raid_device;
-mod mirage_fs;
-mod png_disk;
 mod jpeg_disk;
-mod webp_disk;
+mod mirage_fs;
 mod mp4_disk;
-mod webdav_server;
+mod png_disk;
+mod raid_device;
 mod url_media;
+mod webdav_server;
+mod webp_disk;
 
 use block_device::BlockDevice;
-use raid_device::Raid0Device;
-use mirage_fs::MirageFS;
-use png_disk::PngDisk;
 use jpeg_disk::JpegDisk;
-use webp_disk::WebPDisk;
+use mirage_fs::MirageFS;
 use mp4_disk::Mp4Disk;
-use url_media::{open_media_url, is_url};
+use png_disk::PngDisk;
+use raid_device::Raid0Device;
+use url_media::{is_url, open_media_url};
+use webp_disk::WebPDisk;
 
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
 #[command(version = "1.5.0")]
-#[command(about = "High-Stealth Steganographic Filesystem", long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files.")]
+#[command(
+    about = "High-Stealth Steganographic Filesystem",
+    long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files."
+)]
 struct Cli {
     #[arg(value_name = "MOUNT_POINT")]
     mount_point: PathBuf,
@@ -43,7 +49,11 @@ struct Cli {
     format: bool,
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
-    #[arg(short, long, help = "Serve via WebDAV instead of mounting (No FUSE required)")]
+    #[arg(
+        short,
+        long,
+        help = "Serve via WebDAV instead of mounting (No FUSE required)"
+    )]
     webdav: bool,
     #[arg(long, default_value = "8080", help = "Port for WebDAV server")]
     port: u16,
@@ -52,13 +62,15 @@ struct Cli {
 }
 
 fn print_banner() {
-    println!(r#"
+    println!(
+        r#"
     ██▄  ▄██ ▄▄ ▄▄▄▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ ██████ ▄█████
     ██ ▀▀ ██ ██ ██▄█▄ ██▀██ ██ ▄▄ ██▄▄  ██▄▄   ▀▀▀▄▄▄
     ██    ██ ██ ██ ██ ██▀██ ▀███▀ ██▄▄▄ ██     █████▀
 
     v1.5.0 | By Seuriin (SSL-ACTX)
-    "#);
+    "#
+    );
 }
 
 fn init_logger(verbosity: u8) {
@@ -69,16 +81,18 @@ fn init_logger(verbosity: u8) {
     };
 
     Builder::new()
-    .format(|buf, record| {
-        let style = buf.default_level_style(record.level());
-        writeln!(buf, "[{} {}] {}",
-                 buf.timestamp_seconds(),
-                 style.value(record.level()),
-                 record.args()
-        )
-    })
-    .filter(None, level)
-    .init();
+        .format(|buf, record| {
+            let style = buf.default_level_style(record.level());
+            writeln!(
+                buf,
+                "[{} {}] {}",
+                buf.timestamp_seconds(),
+                style.value(record.level()),
+                record.args()
+            )
+        })
+        .filter(None, level)
+        .init();
 }
 
 fn main() -> anyhow::Result<()> {
@@ -107,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Prepare Mount Point (Only for FUSE mode)
-    #[cfg(feature = "fuse")]
+    #[cfg(all(feature = "fuse", unix))]
     if !cli.webdav {
         if !cli.mount_point.exists() {
             info!("Creating mount point at {:?}", cli.mount_point);
@@ -135,12 +149,17 @@ fn main() -> anyhow::Result<()> {
     // --- Initialize Storage Layer ---
     let mut disks: Vec<Box<dyn BlockDevice>> = Vec::new();
     let mut read_only = cli.read_only;
-    info!("Initializing storage array with {} carrier(s)...", cli.image_files.len());
+    info!(
+        "Initializing storage array with {} carrier(s)...",
+        cli.image_files.len()
+    );
 
     for source in cli.image_files {
         if is_url(&source) {
             if cli.format {
-                anyhow::bail!("Formatting is not supported for media URLs (read-only mode). Remove --format.");
+                anyhow::bail!(
+                    "Formatting is not supported for media URLs (read-only mode). Remove --format."
+                );
             }
             info!("Loading remote carrier: {}", source);
             let disk = open_media_url(&source, &password)?;
@@ -150,7 +169,8 @@ fn main() -> anyhow::Result<()> {
         }
 
         let path = PathBuf::from(&source);
-        let extension = path.extension()
+        let extension = path
+            .extension()
             .and_then(|ext| ext.to_str())
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| "unknown".to_string());
@@ -176,8 +196,12 @@ fn main() -> anyhow::Result<()> {
     let raid_controller = Raid0Device::new(disks, cli.format)?;
 
     // Initialize Filesystem
+    #[cfg(unix)]
     let uid = unsafe { libc::getuid() };
+    #[cfg(unix)]
     let gid = unsafe { libc::getgid() };
+    #[cfg(windows)]
+    let (uid, gid) = (0, 0);
 
     let fs = match MirageFS::new(Box::new(raid_controller), cli.format, uid, gid, read_only) {
         Ok(fs) => fs,
@@ -193,12 +217,12 @@ fn main() -> anyhow::Result<()> {
         return run_webdav(fs, cli.port);
     }
 
-    #[cfg(feature = "fuse")]
+    #[cfg(all(feature = "fuse", unix))]
     {
         run_fuse(fs, cli.mount_point, read_only)
     }
 
-    #[cfg(not(feature = "fuse"))]
+    #[cfg(not(all(feature = "fuse", unix)))]
     {
         info!("MirageFS compiled without FUSE support. Defaulting to WebDAV.");
         run_webdav(fs, cli.port)
@@ -218,7 +242,7 @@ fn run_webdav(fs: MirageFS, port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "fuse", unix))]
 fn run_fuse(fs: MirageFS, mount_point: PathBuf, read_only: bool) -> anyhow::Result<()> {
     let mut options = vec![
         MountOption::FSName("mirage".to_string()),
@@ -245,24 +269,23 @@ fn run_fuse(fs: MirageFS, mount_point: PathBuf, read_only: bool) -> anyhow::Resu
     ctrlc::set_handler(move || {
         info!("\n[!] Received Ctrl+C. Force unmounting...");
         let status = Command::new("fusermount")
-        .arg("-u")
-        .arg("-z")
-        .arg(&mount_path)
-        .status();
+            .arg("-u")
+            .arg("-z")
+            .arg(&mount_path)
+            .status();
 
         if status.is_err() || !status.unwrap().success() {
             // Fallback for non-FUSE systems or weird states
-            let _ = Command::new("umount")
-            .arg(&mount_path)
-            .status();
+            let _ = Command::new("umount").arg(&mount_path).status();
         }
-    }).ok();
+    })
+    .ok();
 
     match fuser::mount2(fs, mount_point, &options) {
         Ok(_) => {
             info!("Unmounted successfully.");
             Ok(())
-        },
+        }
         Err(e) => {
             error!("FUSE Mount Failed: {}", e);
             warn!("If FUSE is not installed, try running with --webdav");

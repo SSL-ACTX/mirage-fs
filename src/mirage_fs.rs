@@ -1,22 +1,22 @@
 // src/mirage_fs.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE};
-#[cfg(feature = "fuse")]
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+#[cfg(all(feature = "fuse", unix))]
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, ReplyEmpty, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyWrite, Request, TimeOrNow,
 };
-#[cfg(feature = "fuse")]
-use std::ffi::OsStr;
-use libc::{EIO, ENOENT, EEXIST, ENOTEMPTY, EACCES};
+use libc::{EACCES, EEXIST, EIO, ENOENT, ENOTEMPTY};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(all(feature = "fuse", unix))]
+use std::ffi::OsStr;
 use std::io::Write;
-use flate2::write::ZlibEncoder;
-use flate2::read::ZlibDecoder;
-use flate2::Compression;
 use std::path::Path;
-use log::{info, error, warn};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Maximum metadata blocks (hard cap)
 const METADATA_BLOCKS: u32 = 256;
@@ -26,8 +26,12 @@ const TTL: Duration = Duration::from_secs(1);
 const METADATA_MAGIC: [u8; 8] = *b"MRGMDATA";
 const METADATA_HEADER_LEN: usize = 16;
 
-fn default_freeze_timestamps() -> bool { true }
-fn default_frozen_time_secs() -> u64 { 0 }
+fn default_freeze_timestamps() -> bool {
+    true
+}
+fn default_frozen_time_secs() -> u64 {
+    0
+}
 
 // --- Internal Types ---
 
@@ -56,7 +60,7 @@ pub struct SerializedFileAttr {
 pub struct Inode {
     pub attr: SerializedFileAttr,
     // List of physical block indices owned by this file.
-    pub blocks: Vec<u32>
+    pub blocks: Vec<u32>,
 }
 
 /// The Superblock contains the entire filesystem state.
@@ -109,9 +113,9 @@ pub struct MirageFS {
 impl std::fmt::Debug for MirageFS {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MirageFS")
-        .field("inodes_count", &self.inodes.len())
-        .field("disk_usage_blocks", &self.disk_size_blocks)
-        .finish()
+            .field("inodes_count", &self.inodes.len())
+            .field("disk_usage_blocks", &self.disk_size_blocks)
+            .finish()
     }
 }
 
@@ -141,7 +145,8 @@ impl MirageFS {
 
     fn metadata_blocks_needed_current(&self) -> anyhow::Result<u32> {
         let sb = Superblock {
-            inodes: self.inodes.clone(), directory_map: self.directory_map.clone(),
+            inodes: self.inodes.clone(),
+            directory_map: self.directory_map.clone(),
             next_inode: self.next_inode,
             disk_size_blocks: self.disk_size_blocks,
             block_owner: self.block_owner.clone(),
@@ -167,9 +172,14 @@ impl MirageFS {
         blocks.sort_by(|a, b| b.cmp(a));
 
         for old_idx in blocks {
-            let data = self.disk.read_block(old_idx).map_err(|e| anyhow::anyhow!(e))?;
+            let data = self
+                .disk
+                .read_block(old_idx)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let new_idx = old_idx + delta;
-            self.disk.write_block(new_idx, &data).map_err(|e| anyhow::anyhow!(e))?;
+            self.disk
+                .write_block(new_idx, &data)
+                .map_err(|e| anyhow::anyhow!(e))?;
 
             if let Some(owner_ino) = self.block_owner.remove(&old_idx) {
                 self.block_owner.insert(new_idx, owner_ino);
@@ -188,7 +198,10 @@ impl MirageFS {
         Ok(())
     }
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     fn effective_time_secs(&self) -> u64 {
@@ -213,7 +226,13 @@ impl MirageFS {
         self.effective_time_secs()
     }
 
-    pub fn new(disk: Box<dyn BlockDevice>, format: bool, uid: u32, gid: u32, read_only: bool) -> anyhow::Result<Self> {
+    pub fn new(
+        disk: Box<dyn BlockDevice>,
+        format: bool,
+        uid: u32,
+        gid: u32,
+        read_only: bool,
+    ) -> anyhow::Result<Self> {
         if read_only && format {
             anyhow::bail!("Read-only media cannot be formatted.");
         }
@@ -228,17 +247,23 @@ impl MirageFS {
                 let mut freeze_timestamps = sb.freeze_timestamps;
                 let mut frozen_time_secs = sb.frozen_time_secs;
                 if !freeze_timestamps || frozen_time_secs == 0 {
-                    let fallback = sb.inodes.get(&1).map(|i| i.attr.mtime_secs).unwrap_or_else(Self::now_secs);
+                    let fallback = sb
+                        .inodes
+                        .get(&1)
+                        .map(|i| i.attr.mtime_secs)
+                        .unwrap_or_else(Self::now_secs);
                     frozen_time_secs = fallback;
                     freeze_timestamps = true;
                 }
                 let mut fs = MirageFS {
                     disk,
-                    inodes: sb.inodes, directory_map: sb.directory_map,
+                    inodes: sb.inodes,
+                    directory_map: sb.directory_map,
                     next_inode: sb.next_inode,
                     disk_size_blocks: sb.disk_size_blocks,
                     block_owner: sb.block_owner,
-                    uid, gid,
+                    uid,
+                    gid,
                     read_only,
                     metadata_blocks_reserved: sb.metadata_blocks_reserved,
                     freeze_timestamps,
@@ -264,7 +289,10 @@ impl MirageFS {
         } else if !format {
             let err = load_result.err().unwrap();
             error!("Failed to load metadata: {}", err);
-            anyhow::bail!("Could not load MirageFS metadata. Use --format if this is a new volume. Error: {}", err);
+            anyhow::bail!(
+                "Could not load MirageFS metadata. Use --format if this is a new volume. Error: {}",
+                err
+            );
         }
 
         // Initialize empty filesystem
@@ -272,11 +300,13 @@ impl MirageFS {
         let frozen_time_secs = Self::now_secs();
         let mut fs = MirageFS {
             disk,
-            inodes: HashMap::new(), directory_map: HashMap::new(),
+            inodes: HashMap::new(),
+            directory_map: HashMap::new(),
             next_inode: 2,
             disk_size_blocks: 1,
             block_owner: HashMap::new(),
-            uid, gid,
+            uid,
+            gid,
             read_only,
             metadata_blocks_reserved: 1,
             freeze_timestamps: true,
@@ -285,11 +315,23 @@ impl MirageFS {
 
         // Create Root Directory (Inode 1)
         let root_attr = SerializedFileAttr {
-            ino: 1, size: 0, blocks: 0,
-            kind: MirageFileType::Directory, perm: 0o755, nlink: 2,
-            uid, gid, mtime_secs: frozen_time_secs
+            ino: 1,
+            size: 0,
+            blocks: 0,
+            kind: MirageFileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid,
+            gid,
+            mtime_secs: frozen_time_secs,
         };
-        fs.inodes.insert(1, Inode { attr: root_attr, blocks: Vec::new() });
+        fs.inodes.insert(
+            1,
+            Inode {
+                attr: root_attr,
+                blocks: Vec::new(),
+            },
+        );
         fs.directory_map.insert(1, HashMap::new());
 
         let needed = fs.metadata_blocks_needed_current()?;
@@ -334,8 +376,16 @@ impl MirageFS {
         Ok(current_ino)
     }
 
-    pub fn set_attr_internal(&mut self, ino: u64, size: Option<u64>, mtime: Option<u64>, mode: Option<u16>) -> Result<(), i32> {
-        if self.read_only { return Err(EACCES); }
+    pub fn set_attr_internal(
+        &mut self,
+        ino: u64,
+        size: Option<u64>,
+        mtime: Option<u64>,
+        mode: Option<u16>,
+    ) -> Result<(), i32> {
+        if self.read_only {
+            return Err(EACCES);
+        }
         if let Some(inode) = self.inodes.get_mut(&ino) {
             if let Some(s) = size {
                 inode.attr.size = s;
@@ -356,22 +406,32 @@ impl MirageFS {
     }
 
     pub fn create_file_internal(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
-        if self.read_only { return Err(EACCES); }
+        if self.read_only {
+            return Err(EACCES);
+        }
         let new_ino = self.allocate_inode(MirageFileType::RegularFile, 0o644);
-        self.directory_map.entry(parent).or_default().insert(name.to_string(), new_ino);
+        self.directory_map
+            .entry(parent)
+            .or_default()
+            .insert(name.to_string(), new_ino);
         let _ = self.sync_disk();
         Ok(new_ino)
     }
 
     pub fn mkdir_internal(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
-        if self.read_only { return Err(EACCES); }
+        if self.read_only {
+            return Err(EACCES);
+        }
         if let Some(children) = self.directory_map.get(&parent) {
             if children.contains_key(name) {
                 return Err(EEXIST);
             }
         }
         let new_ino = self.allocate_inode(MirageFileType::Directory, 0o755);
-        self.directory_map.entry(parent).or_default().insert(name.to_string(), new_ino);
+        self.directory_map
+            .entry(parent)
+            .or_default()
+            .insert(name.to_string(), new_ino);
         // Initialize empty children map
         self.directory_map.insert(new_ino, HashMap::new());
         let _ = self.sync_disk();
@@ -379,7 +439,9 @@ impl MirageFS {
     }
 
     pub fn unlink_internal(&mut self, parent: u64, name: &str) -> Result<(), i32> {
-        if self.read_only { return Err(EACCES); }
+        if self.read_only {
+            return Err(EACCES);
+        }
         let ino_to_remove = if let Some(children) = self.directory_map.get_mut(&parent) {
             children.remove(name)
         } else {
@@ -390,7 +452,11 @@ impl MirageFS {
             self.free_inode_blocks(ino);
             self.inodes.remove(&ino);
             self.directory_map.remove(&ino);
-            if self.sync_disk() == 0 { Ok(()) } else { Err(EIO) }
+            if self.sync_disk() == 0 {
+                Ok(())
+            } else {
+                Err(EIO)
+            }
         } else {
             Err(ENOENT)
         }
@@ -398,7 +464,9 @@ impl MirageFS {
 
     // Safe directory removal: Checks if directory is empty first.
     pub fn rmdir_internal(&mut self, parent: u64, name: &str) -> Result<(), i32> {
-        if self.read_only { return Err(EACCES); }
+        if self.read_only {
+            return Err(EACCES);
+        }
         if let Some(children) = self.directory_map.get(&parent) {
             if let Some(&ino) = children.get(name) {
                 if let Some(grandkids) = self.directory_map.get(&ino) {
@@ -412,21 +480,38 @@ impl MirageFS {
     }
 
     // Atomic Rename / Move logic
-    pub fn rename_internal(&mut self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
-        if self.read_only { return Err(EACCES); }
+    pub fn rename_internal(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), i32> {
+        if self.read_only {
+            return Err(EACCES);
+        }
         let name_str = name.to_string();
         let newname_str = newname.to_string();
 
-        let ino_opt = self.directory_map.get(&parent)
-        .and_then(|c| c.get(&name_str).cloned());
+        let ino_opt = self
+            .directory_map
+            .get(&parent)
+            .and_then(|c| c.get(&name_str).cloned());
 
         if let Some(ino) = ino_opt {
             // Handle overwrite at destination
-            let target_exists = self.directory_map.get(&newparent)
-            .map(|c| c.contains_key(&newname_str)).unwrap_or(false);
+            let target_exists = self
+                .directory_map
+                .get(&newparent)
+                .map(|c| c.contains_key(&newname_str))
+                .unwrap_or(false);
 
             if target_exists {
-                if let Some(target_ino) = self.directory_map.get(&newparent).and_then(|c| c.get(&newname_str).cloned()) {
+                if let Some(target_ino) = self
+                    .directory_map
+                    .get(&newparent)
+                    .and_then(|c| c.get(&newname_str).cloned())
+                {
                     if let Some(inode) = self.inodes.get(&target_ino) {
                         if matches!(inode.attr.kind, MirageFileType::Directory) {
                             if let Some(c) = self.directory_map.get(&target_ino) {
@@ -451,9 +536,16 @@ impl MirageFS {
             }
 
             // Insert into new parent
-            self.directory_map.entry(newparent).or_default().insert(newname_str, ino);
+            self.directory_map
+                .entry(newparent)
+                .or_default()
+                .insert(newname_str, ino);
 
-            if self.sync_disk() == 0 { Ok(()) } else { Err(EIO) }
+            if self.sync_disk() == 0 {
+                Ok(())
+            } else {
+                Err(EIO)
+            }
         } else {
             Err(ENOENT)
         }
@@ -491,12 +583,15 @@ impl MirageFS {
                     Ok(block_data) => {
                         let available_in_block = BLOCK_SIZE - block_offset;
                         let read_len = std::cmp::min(remaining_size, available_in_block);
-                        collected_data.extend_from_slice(&block_data[block_offset..block_offset + read_len]);
+                        collected_data
+                            .extend_from_slice(&block_data[block_offset..block_offset + read_len]);
                         current_offset += read_len;
                         remaining_size -= read_len;
                     }
                     Err(_) => {
-                        if collected_data.is_empty() { return Err(EIO); }
+                        if collected_data.is_empty() {
+                            return Err(EIO);
+                        }
                         break;
                     }
                 }
@@ -507,8 +602,15 @@ impl MirageFS {
         }
     }
 
-    pub fn write_data_internal(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, i32> {
-        if self.read_only { return Err(EACCES); }
+    pub fn write_data_internal(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, i32> {
+        if self.read_only {
+            return Err(EACCES);
+        }
         let mut total_written: usize = 0;
         let mut current_offset = offset as usize;
 
@@ -549,7 +651,9 @@ impl MirageFS {
             block_data[block_offset..block_offset + chunk_size].copy_from_slice(chunk_data);
 
             if let Err(_) = self.disk.write_block(abs_block_idx, &block_data) {
-                if total_written > 0 { break; }
+                if total_written > 0 {
+                    break;
+                }
                 return Err(EIO);
             }
 
@@ -562,7 +666,9 @@ impl MirageFS {
         if let Some(inode) = self.inodes.get_mut(&ino) {
             inode.blocks = blocks;
             let end_pos = (offset as u64) + (total_written as u64);
-            if end_pos > inode.attr.size { inode.attr.size = end_pos; }
+            if end_pos > inode.attr.size {
+                inode.attr.size = end_pos;
+            }
             inode.attr.blocks = inode.blocks.len() as u64;
             // Update mtime
             inode.attr.mtime_secs = effective_time;
@@ -573,7 +679,9 @@ impl MirageFS {
     fn load_metadata(disk: &Box<dyn BlockDevice>) -> anyhow::Result<Superblock> {
         let mut raw_data = Vec::new();
         // Check first block specifically for emptiness to fail fast
-        let first = disk.read_block(SUPERBLOCK_ID).map_err(|e| anyhow::anyhow!(e))?;
+        let first = disk
+            .read_block(SUPERBLOCK_ID)
+            .map_err(|e| anyhow::anyhow!(e))?;
         if first.iter().all(|&x| x == 0) {
             return Err(anyhow::anyhow!("Block 0 is empty (No filesystem found)"));
         }
@@ -586,7 +694,9 @@ impl MirageFS {
 
             raw_data.extend_from_slice(&first);
             for i in 1..blocks_needed as u32 {
-                let block = disk.read_block(SUPERBLOCK_ID + i).map_err(|e| anyhow::anyhow!(e))?;
+                let block = disk
+                    .read_block(SUPERBLOCK_ID + i)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 raw_data.extend_from_slice(&block);
             }
 
@@ -605,7 +715,9 @@ impl MirageFS {
 
         raw_data.extend_from_slice(&first);
         for i in 1..METADATA_BLOCKS {
-            let block = disk.read_block(SUPERBLOCK_ID + i).map_err(|e| anyhow::anyhow!(e))?;
+            let block = disk
+                .read_block(SUPERBLOCK_ID + i)
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw_data.extend_from_slice(&block);
         }
 
@@ -620,7 +732,8 @@ impl MirageFS {
 
     pub fn save_metadata(&mut self) -> anyhow::Result<()> {
         let sb = Superblock {
-            inodes: self.inodes.clone(), directory_map: self.directory_map.clone(),
+            inodes: self.inodes.clone(),
+            directory_map: self.directory_map.clone(),
             next_inode: self.next_inode,
             disk_size_blocks: self.disk_size_blocks,
             block_owner: self.block_owner.clone(),
@@ -641,7 +754,10 @@ impl MirageFS {
 
         let blocks_needed = Self::metadata_blocks_needed_for(compressed_data.len());
         if blocks_needed > METADATA_BLOCKS {
-            error!("CRITICAL: Metadata size exceeds hard cap ({} blocks)", METADATA_BLOCKS);
+            error!(
+                "CRITICAL: Metadata size exceeds hard cap ({} blocks)",
+                METADATA_BLOCKS
+            );
         }
         if blocks_needed > self.metadata_blocks_reserved {
             self.expand_metadata_reserve(blocks_needed)?;
@@ -649,17 +765,24 @@ impl MirageFS {
 
         // Check if metadata fits
         if payload.len() > (METADATA_BLOCKS as usize * BLOCK_SIZE) {
-            error!("CRITICAL: Metadata size ({}) exceeds reserved blocks!", payload.len());
+            error!(
+                "CRITICAL: Metadata size ({}) exceeds reserved blocks!",
+                payload.len()
+            );
             // In a real FS, we'd allocate dynamic metadata blocks.
             // For now, warn but try to write what we can or fail.
         }
 
         let chunks = payload.chunks(BLOCK_SIZE);
         for (i, chunk) in chunks.enumerate() {
-            if i >= METADATA_BLOCKS as usize { break; }
+            if i >= METADATA_BLOCKS as usize {
+                break;
+            }
             let mut block = [0u8; BLOCK_SIZE];
             block[0..chunk.len()].copy_from_slice(chunk);
-            self.disk.write_block(SUPERBLOCK_ID + i as u32, &block).map_err(|e| anyhow::anyhow!(e))?;
+            self.disk
+                .write_block(SUPERBLOCK_ID + i as u32, &block)
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         Ok(())
     }
@@ -668,12 +791,23 @@ impl MirageFS {
         let ino = self.next_inode;
         self.next_inode += 1;
         let attr = SerializedFileAttr {
-            ino, size: 0, blocks: 0,
-            kind, perm, nlink: 1,
-            uid: self.uid, gid: self.gid,
-            mtime_secs: self.effective_time_secs()
+            ino,
+            size: 0,
+            blocks: 0,
+            kind,
+            perm,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            mtime_secs: self.effective_time_secs(),
         };
-        self.inodes.insert(ino, Inode { attr, blocks: Vec::new() });
+        self.inodes.insert(
+            ino,
+            Inode {
+                attr,
+                blocks: Vec::new(),
+            },
+        );
         ino
     }
 
@@ -737,32 +871,59 @@ impl MirageFS {
 }
 
 // FUSE Adapter Layer (Feature Gated)
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "fuse", unix))]
 impl Filesystem for MirageFS {
-    fn destroy(&mut self) { let _ = self.sync_disk(); }
+    fn destroy(&mut self) {
+        let _ = self.sync_disk();
+    }
     fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+        if self.sync_disk() == 0 {
+            reply.ok();
+        } else {
+            reply.error(EIO);
+        }
     }
     fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        if self.sync_disk() == 0 { reply.ok(); } else { reply.error(EIO); }
+        if self.sync_disk() == 0 {
+            reply.ok();
+        } else {
+            reply.error(EIO);
+        }
     }
-    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _u: u32, _f: i32, reply: ReplyCreate) {
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _u: u32,
+        _f: i32,
+        reply: ReplyCreate,
+    ) {
         let name_str = name.to_str().unwrap();
         match self.create_file_internal(parent, name_str) {
             Ok(ino) => {
                 let attr: FileAttr = (&self.inodes[&ino].attr).into();
                 reply.created(&TTL, &attr, 0, 0, 0)
-            },
+            }
             Err(e) => reply.error(e),
         }
     }
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _u: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _u: u32,
+        reply: ReplyEntry,
+    ) {
         let name_str = name.to_str().unwrap();
         match self.mkdir_internal(parent, name_str) {
             Ok(ino) => {
                 let attr: FileAttr = (&self.inodes[&ino].attr).into();
                 reply.entry(&TTL, &attr, 0)
-            },
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -779,7 +940,16 @@ impl Filesystem for MirageFS {
             Err(e) => reply.error(e),
         }
     }
-    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
         let name_str = name.to_str().unwrap();
         let newname_str = newname.to_str().unwrap();
         match self.rename_internal(parent, name_str, newparent, newname_str) {
@@ -787,11 +957,39 @@ impl Filesystem for MirageFS {
             Err(e) => reply.error(e),
         }
     }
-    fn setattr(&mut self, _req: &Request, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _a: Option<TimeOrNow>, _m: Option<TimeOrNow>, _c: Option<SystemTime>, _fh: Option<u64>, _cr: Option<SystemTime>, _ch: Option<SystemTime>, _bk: Option<SystemTime>, _fl: Option<u32>, reply: ReplyAttr) {
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _a: Option<TimeOrNow>,
+        _m: Option<TimeOrNow>,
+        _c: Option<SystemTime>,
+        _fh: Option<u64>,
+        _cr: Option<SystemTime>,
+        _ch: Option<SystemTime>,
+        _bk: Option<SystemTime>,
+        _fl: Option<u32>,
+        reply: ReplyAttr,
+    ) {
         // Simple SetAttr placeholder
         reply.error(EACCES);
     }
-    fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _w: u32, _f: i32, _l: Option<u64>, reply: ReplyWrite) {
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _w: u32,
+        _f: i32,
+        _l: Option<u64>,
+        reply: ReplyWrite,
+    ) {
         match self.write_data_internal(ino, offset as u64, data) {
             Ok(bytes) => reply.written(bytes as u32),
             Err(e) => reply.error(e),
@@ -815,18 +1013,38 @@ impl Filesystem for MirageFS {
             Some(inode) => {
                 let attr: FileAttr = (&inode.attr).into();
                 reply.attr(&TTL, &attr)
-            },
+            }
             None => reply.error(ENOENT),
         }
     }
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _fl: i32, _l: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _fl: i32,
+        _l: Option<u64>,
+        reply: ReplyData,
+    ) {
         match self.read_data_internal(ino, offset as u64, size) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
         }
     }
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        if offset > 0 { reply.ok(); return; }
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        if offset > 0 {
+            reply.ok();
+            return;
+        }
         let _ = reply.add(ino, 1, FileType::Directory, ".");
         let _ = reply.add(ino, 2, FileType::Directory, "..");
         let entries = self.readdir_internal(ino);
@@ -835,14 +1053,14 @@ impl Filesystem for MirageFS {
                 MirageFileType::Directory => FileType::Directory,
                 MirageFileType::RegularFile => FileType::RegularFile,
             };
-            let _ = reply.add(*child_ino, (i+3) as i64, fuse_kind, name);
+            let _ = reply.add(*child_ino, (i + 3) as i64, fuse_kind, name);
         }
         reply.ok();
     }
 }
 
 // Helper to convert internal attrs to FUSE attrs
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "fuse", unix))]
 impl From<&SerializedFileAttr> for FileAttr {
     fn from(s: &SerializedFileAttr) -> Self {
         let kind = match s.kind {
@@ -850,13 +1068,21 @@ impl From<&SerializedFileAttr> for FileAttr {
             MirageFileType::RegularFile => FileType::RegularFile,
         };
         FileAttr {
-            ino: s.ino, size: s.size, blocks: s.blocks,
+            ino: s.ino,
+            size: s.size,
+            blocks: s.blocks,
             atime: UNIX_EPOCH + Duration::from_secs(s.mtime_secs),
             mtime: UNIX_EPOCH + Duration::from_secs(s.mtime_secs),
             ctime: UNIX_EPOCH + Duration::from_secs(s.mtime_secs),
             crtime: UNIX_EPOCH + Duration::from_secs(s.mtime_secs),
-            kind, perm: s.perm, nlink: s.nlink, uid: s.uid, gid: s.gid,
-            rdev: 0, flags: 0, blksize: 512,
+            kind,
+            perm: s.perm,
+            nlink: s.nlink,
+            uid: s.uid,
+            gid: s.gid,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
         }
     }
 }
