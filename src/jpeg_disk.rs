@@ -1,21 +1,21 @@
 // src/jpeg_disk.rs
 use crate::block_device::{BlockDevice, BLOCK_SIZE, ENCRYPTED_BLOCK_SIZE};
-use std::io::{self, Result};
-use std::path::PathBuf;
-use std::fs::{self, OpenOptions, metadata};
-use filetime::{FileTime, set_file_times};
-use img_parts::jpeg::{Jpeg, JpegSegment};
-use img_parts::Bytes;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce
-};
-use rand::{RngCore, thread_rng};
-use log::{info, debug, warn};
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
-    Argon2
+    Argon2,
 };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use filetime::{set_file_times, FileTime};
+use img_parts::jpeg::{Jpeg, JpegSegment};
+use img_parts::Bytes;
+use log::{debug, info, warn};
+use rand::{thread_rng, RngCore};
+use std::fs::{self, metadata, OpenOptions};
+use std::io::{self, Result};
+use std::path::PathBuf;
 
 // JPEG APP1 Marker used for Exif metadata
 const MIRAGE_MARKER: u8 = 0xE1;
@@ -46,7 +46,7 @@ impl JpegDisk {
 
         let file_data = fs::read(&path)?;
         let mut jpeg = Jpeg::from_bytes(Bytes::from(file_data))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // 1. Scan for existing MirageFS data
         let mut encoded_storage = Vec::new();
@@ -58,10 +58,12 @@ impl JpegDisk {
                 // Validate Signature: Exif Header + TIFF Header + DNG Tag
                 if contents.len() > STRUCTURE_OVERHEAD
                     && &contents[0..6] == EXIF_HEADER
-                    && contents[16] == DNG_TAG[0] && contents[17] == DNG_TAG[1] {
-                        encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
-                        segment_indices.push(i);
-                    }
+                    && contents[16] == DNG_TAG[0]
+                    && contents[17] == DNG_TAG[1]
+                {
+                    encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
+                    segment_indices.push(i);
+                }
             }
         }
 
@@ -73,7 +75,10 @@ impl JpegDisk {
         // 2. Initialize Storage or Format
         let raw_storage = if !format {
             if encoded_storage.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "No MirageFS (DNG) found."));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No MirageFS (DNG) found.",
+                ));
             }
             Self::concentrate_entropy(&encoded_storage)
         } else {
@@ -89,20 +94,26 @@ impl JpegDisk {
         }
 
         if raw_storage.len() < SALT_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Storage too small."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Storage too small.",
+            ));
         }
 
         // 3. Crypto Setup (Argon2id + XChaCha20-Poly1305)
         let salt_slice = &raw_storage[0..16];
         debug!("Deriving key...");
         let salt_string = SaltString::encode_b64(salt_slice)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let mut key_buffer = [0u8; 32];
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
         let key = Key::from_slice(&key_buffer);
@@ -118,13 +129,32 @@ impl JpegDisk {
                 let nonce = Nonce::from_slice(&packet[0..12]);
                 let ciphertext = &packet[12..];
 
-                if cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }).is_err() {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed."));
+                if cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &[],
+                        },
+                    )
+                    .is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Decryption Failed.",
+                    ));
                 }
             }
         }
 
-        let disk = JpegDisk { path, cipher, raw_storage, jpeg_structure: jpeg, atime, mtime };
+        let disk = JpegDisk {
+            path,
+            cipher,
+            raw_storage,
+            jpeg_structure: jpeg,
+            atime,
+            mtime,
+        };
         if let Err(e) = disk.restore_times() {
             warn!("JPEG: Failed to restore carrier timestamps: {}", e);
         }
@@ -150,16 +180,21 @@ impl JpegDisk {
                 let contents = segment.contents();
                 if contents.len() > STRUCTURE_OVERHEAD
                     && &contents[0..6] == EXIF_HEADER
-                    && contents[16] == DNG_TAG[0] && contents[17] == DNG_TAG[1] {
-                        encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
-                        segment_indices.push(i);
-                    }
+                    && contents[16] == DNG_TAG[0]
+                    && contents[17] == DNG_TAG[1]
+                {
+                    encoded_storage.extend_from_slice(&contents[STRUCTURE_OVERHEAD..]);
+                    segment_indices.push(i);
+                }
             }
         }
 
         let raw_storage = if !format {
             if encoded_storage.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "No MirageFS (DNG) found."));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No MirageFS (DNG) found.",
+                ));
             }
             Self::concentrate_entropy(&encoded_storage)
         } else {
@@ -170,18 +205,24 @@ impl JpegDisk {
 
         // Crypto setup and verify similar to new()
         if raw_storage.len() < SALT_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Storage too small."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Storage too small.",
+            ));
         }
 
         let salt_slice = &raw_storage[0..16];
         let salt_string = SaltString::encode_b64(salt_slice)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt_string)
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let mut key_buffer = [0u8; 32];
-        let hash_output = password_hash.hash.ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
+        let hash_output = password_hash
+            .hash
+            .ok_or(io::Error::new(io::ErrorKind::Other, "Hash failed"))?;
         key_buffer.copy_from_slice(&hash_output.as_bytes()[0..32]);
 
         let key = Key::from_slice(&key_buffer);
@@ -194,13 +235,32 @@ impl JpegDisk {
                 let packet = &raw_storage[start..end];
                 let nonce = Nonce::from_slice(&packet[0..12]);
                 let ciphertext = &packet[12..];
-                if cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }).is_err() {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Decryption Failed."));
+                if cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &[],
+                        },
+                    )
+                    .is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Decryption Failed.",
+                    ));
                 }
             }
         }
 
-        let disk = JpegDisk { path, cipher, raw_storage, jpeg_structure: jpeg, atime, mtime };
+        let disk = JpegDisk {
+            path,
+            cipher,
+            raw_storage,
+            jpeg_structure: jpeg,
+            atime,
+            mtime,
+        };
 
         Ok(disk)
     }
@@ -287,25 +347,35 @@ impl JpegDisk {
 }
 
 impl BlockDevice for JpegDisk {
-    fn block_count(&self) -> u64 { u32::MAX as u64 }
+    fn block_count(&self) -> u64 {
+        u32::MAX as u64
+    }
 
     fn read_block(&self, index: u32) -> Result<[u8; BLOCK_SIZE]> {
         let start_offset = SALT_SIZE + (index as usize * ENCRYPTED_BLOCK_SIZE);
         let end_offset = start_offset + ENCRYPTED_BLOCK_SIZE;
 
-        if end_offset > self.raw_storage.len() { return Ok([0u8; BLOCK_SIZE]); }
+        if end_offset > self.raw_storage.len() {
+            return Ok([0u8; BLOCK_SIZE]);
+        }
 
         let encrypted_packet = &self.raw_storage[start_offset..end_offset];
         let nonce = Nonce::from_slice(&encrypted_packet[0..12]);
         let ciphertext = &encrypted_packet[12..];
 
-        match self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] }) {
+        match self.cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &[],
+            },
+        ) {
             Ok(plaintext) => {
                 let mut buffer = [0u8; BLOCK_SIZE];
                 buffer.copy_from_slice(&plaintext);
                 Ok(buffer)
             }
-            Err(_) => Ok([0u8; BLOCK_SIZE])
+            Err(_) => Ok([0u8; BLOCK_SIZE]),
         }
     }
 
@@ -314,8 +384,16 @@ impl BlockDevice for JpegDisk {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self.cipher.encrypt(nonce, Payload { msg: data, aad: &[] })
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: data,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
         let mut packet = Vec::with_capacity(ENCRYPTED_BLOCK_SIZE);
         packet.extend_from_slice(&nonce_bytes);
@@ -348,7 +426,9 @@ impl BlockDevice for JpegDisk {
             if s.marker() == MIRAGE_MARKER {
                 let c = s.contents();
                 // Check if it matches our DNG signature
-                if c.len() > 16 && c[16] == DNG_TAG[0] && c[17] == DNG_TAG[1] { return false; }
+                if c.len() > 16 && c[16] == DNG_TAG[0] && c[17] == DNG_TAG[1] {
+                    return false;
+                }
             }
             true
         });
@@ -363,19 +443,25 @@ impl BlockDevice for JpegDisk {
             let bytes = Self::build_exif_segment(chunk);
             let segment = JpegSegment::new_with_contents(MIRAGE_MARKER, bytes);
 
-            if insert_idx < segments.len() { segments.insert(insert_idx, segment); }
-            else { segments.push(segment); }
+            if insert_idx < segments.len() {
+                segments.insert(insert_idx, segment);
+            } else {
+                segments.push(segment);
+            }
             insert_idx += 1;
         }
 
         let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&self.path)?;
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)?;
 
-        self.jpeg_structure.clone().encoder().write_to(&mut file)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.jpeg_structure
+            .clone()
+            .encoder()
+            .write_to(&mut file)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.restore_times()
     }
 }
@@ -384,13 +470,18 @@ impl BlockDevice for JpegDisk {
 mod tests {
     use super::*;
     use crate::block_device::BLOCK_SIZE;
+    use filetime::FileTime;
     use image::codecs::jpeg::JpegEncoder;
     use image::ColorType;
     use std::fs::File;
     use tempfile::tempdir;
-    use filetime::FileTime;
 
-    fn write_test_jpeg(path: &std::path::Path, width: u32, height: u32, quality: u8) -> io::Result<u64> {
+    fn write_test_jpeg(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> io::Result<u64> {
         let mut img = Vec::with_capacity((width * height * 3) as usize);
         for _ in 0..(width * height) {
             img.extend_from_slice(&[12u8, 34u8, 56u8]);
@@ -398,7 +489,8 @@ mod tests {
 
         let mut file = File::create(path)?;
         let mut encoder = JpegEncoder::new_with_quality(&mut file, quality);
-        encoder.encode(&img, width, height, ColorType::Rgb8)
+        encoder
+            .encode(&img, width, height, ColorType::Rgb8)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         Ok(std::fs::metadata(path)?.len())
@@ -424,7 +516,12 @@ mod tests {
         let mtime_after = FileTime::from_last_modification_time(&meta_after);
         let atime_after = FileTime::from_last_access_time(&meta_after);
 
-        assert!(size_after <= initial_size + 200_000, "jpeg bloated: {} -> {}", initial_size, size_after);
+        assert!(
+            size_after <= initial_size + 200_000,
+            "jpeg bloated: {} -> {}",
+            initial_size,
+            size_after
+        );
         assert_eq!(mtime_after, mtime_before);
         assert_eq!(atime_after, atime_before);
     }
@@ -438,12 +535,18 @@ mod tests {
 
         let mut disk = JpegDisk::new(path.clone(), "pass", true).unwrap();
         let block = [0u8; BLOCK_SIZE];
-        for i in 0..24u32 { // ~96 KiB of data
+        for i in 0..24u32 {
+            // ~96 KiB of data
             disk.write_block(i, &block).unwrap();
         }
         disk.sync().unwrap();
 
         let size_after = std::fs::metadata(&path).unwrap().len();
-        assert!(size_after <= initial_size + 300_000, "jpeg bloated: {} -> {}", initial_size, size_after);
+        assert!(
+            size_after <= initial_size + 300_000,
+            "jpeg bloated: {} -> {}",
+            initial_size,
+            size_after
+        );
     }
 }
