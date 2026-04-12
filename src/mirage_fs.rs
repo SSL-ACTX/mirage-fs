@@ -12,6 +12,7 @@ use libc::{EACCES, EEXIST, EIO, ENOENT, ENOTEMPTY};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(all(feature = "fuse", unix))]
 use std::ffi::OsStr;
 use std::io::Write;
@@ -388,6 +389,19 @@ impl MirageFS {
         }
         if let Some(inode) = self.inodes.get_mut(&ino) {
             if let Some(s) = size {
+                let old_blocks = inode.blocks.len();
+                let needed_blocks = if s == 0 {
+                    0
+                } else {
+                    ((s as usize + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize
+                };
+
+                if needed_blocks < old_blocks {
+                    for idx in inode.blocks.drain(needed_blocks..) {
+                        self.block_owner.remove(&idx);
+                    }
+                    inode.attr.blocks = needed_blocks as u64;
+                }
                 inode.attr.size = s;
             }
             if let Some(t) = mtime {
@@ -821,32 +835,45 @@ impl MirageFS {
             return;
         };
 
-        for free_block_idx in blocks_to_free {
-            self.block_owner.remove(&free_block_idx);
+        // Use a set and always consume tail blocks first. This avoids using stale
+        // indices after disk_size_blocks shrinks during compaction.
+        let mut to_free: HashSet<u32> = blocks_to_free.into_iter().collect();
+
+        while !to_free.is_empty() && self.disk_size_blocks > 0 {
             let last_block_idx = self.disk_size_blocks - 1;
 
-            if free_block_idx == last_block_idx {
+            // Fast path: if the last block is itself free, just drop tail.
+            if to_free.remove(&last_block_idx) {
+                self.block_owner.remove(&last_block_idx);
                 self.disk_size_blocks -= 1;
-            } else {
-                // Relocate last block to the hole
-                if let Ok(data) = self.disk.read_block(last_block_idx) {
-                    if self.disk.write_block(free_block_idx, &data).is_ok() {
-                        if let Some(&owner_ino) = self.block_owner.get(&last_block_idx) {
-                            if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
-                                for b in &mut owner_inode.blocks {
-                                    if *b == last_block_idx {
-                                        *b = free_block_idx;
-                                        break;
-                                    }
+                continue;
+            }
+
+            // Pick any remaining hole and fill it with the current tail block.
+            let free_block_idx = match to_free.iter().next() {
+                Some(idx) => *idx,
+                None => break,
+            };
+            to_free.remove(&free_block_idx);
+            self.block_owner.remove(&free_block_idx);
+
+            if let Ok(data) = self.disk.read_block(last_block_idx) {
+                if self.disk.write_block(free_block_idx, &data).is_ok() {
+                    if let Some(owner_ino) = self.block_owner.remove(&last_block_idx) {
+                        if let Some(owner_inode) = self.inodes.get_mut(&owner_ino) {
+                            for b in &mut owner_inode.blocks {
+                                if *b == last_block_idx {
+                                    *b = free_block_idx;
+                                    break;
                                 }
-                                self.block_owner.remove(&last_block_idx);
-                                self.block_owner.insert(free_block_idx, owner_ino);
                             }
                         }
+                        self.block_owner.insert(free_block_idx, owner_ino);
                     }
                 }
-                self.disk_size_blocks -= 1;
             }
+
+            self.disk_size_blocks -= 1;
         }
     }
 

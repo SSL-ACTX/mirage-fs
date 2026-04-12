@@ -139,7 +139,14 @@ impl DavFile for MirageDavFile {
 
             let result = tokio::task::spawn_blocking(move || {
                 let mut locked_fs = fs.lock().unwrap();
-                locked_fs.write_data_internal(ino, pos, &data_to_write)
+                let written = locked_fs.write_data_internal(ino, pos, &data_to_write)?;
+                if written != data_to_write.len() {
+                    return Err(libc::EIO);
+                }
+                if locked_fs.sync_disk() != 0 {
+                    return Err(libc::EIO);
+                }
+                Ok(written)
             })
             .await
             .map_err(|_| FsError::GeneralFailure)?;
@@ -170,8 +177,22 @@ impl DavFile for MirageDavFile {
 
             let new_pos = match pos {
                 SeekFrom::Start(p) => p,
-                SeekFrom::Current(p) => (current_pos as i64 + p) as u64,
-                SeekFrom::End(p) => (size as i64 + p) as u64,
+                SeekFrom::Current(p) => {
+                    let base = i128::from(current_pos);
+                    let target = base + i128::from(p);
+                    if target < 0 || target > i128::from(u64::MAX) {
+                        return Err(FsError::GeneralFailure);
+                    }
+                    target as u64
+                }
+                SeekFrom::End(p) => {
+                    let base = i128::from(size);
+                    let target = base + i128::from(p);
+                    if target < 0 || target > i128::from(u64::MAX) {
+                        return Err(FsError::GeneralFailure);
+                    }
+                    target as u64
+                }
             };
 
             self.current_pos = new_pos;
@@ -514,7 +535,13 @@ impl DavFileSystem for MirageWebDav {
                 while offset < size {
                     let read_len = std::cmp::min(chunk_size, (size - offset) as u32);
                     if let Ok(data) = locked_fs.read_data_internal(src_ino, offset, read_len) {
-                        if let Err(_) = locked_fs.write_data_internal(dest_ino, offset, &data) {
+                        if data.is_empty() {
+                            return Err(libc::EIO);
+                        }
+
+                        let written =
+                            locked_fs.write_data_internal(dest_ino, offset, &data).map_err(|_| libc::EIO)?;
+                        if written != data.len() {
                             return Err(libc::EIO);
                         }
                         offset += data.len() as u64;
@@ -522,6 +549,16 @@ impl DavFileSystem for MirageWebDav {
                         return Err(libc::EIO);
                     }
                 }
+
+                if locked_fs.sync_disk() != 0 {
+                    return Err(libc::EIO);
+                }
+
+                let copied_size = locked_fs.get_inode_size(dest_ino).unwrap_or(0);
+                if copied_size != size {
+                    return Err(libc::EIO);
+                }
+
                 Ok(())
             })
             .await
