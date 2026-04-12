@@ -3,9 +3,9 @@ use clap::{ArgAction, Parser};
 use env_logger::Builder;
 #[cfg(all(feature = "fuse", unix))]
 use fuser::MountOption;
-use log::{error, info, LevelFilter};
 #[cfg(all(feature = "fuse", unix))]
 use log::warn;
+use log::{error, info, LevelFilter};
 #[cfg(all(feature = "fuse", unix))]
 use std::fs;
 use std::io::{self, Write};
