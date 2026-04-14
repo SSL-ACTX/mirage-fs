@@ -15,7 +15,7 @@ use dav_server::{
     DavHandler,
 };
 use futures::FutureExt;
-use hyper::Method;
+use hyper::{Method, StatusCode};
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -40,11 +40,6 @@ pub struct MirageWebDav {
 }
 
 impl MirageWebDav {
-    pub fn new(fs: MirageFS) -> Self {
-        Self {
-            fs: Arc::new(Mutex::new(fs)),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -573,22 +568,37 @@ impl DavFileSystem for MirageWebDav {
     }
 }
 
-pub async fn start_webdav_server(fs: MirageFS, port: u16) {
+// --- Base64 Helper (Minimal Implementation) ---
+fn base64_encode(input: &str) -> String {
+    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    let bytes = input.as_bytes();
+    for chunk in bytes.chunks(3) {
+        let mut b = (chunk[0] as u32) << 16;
+        if chunk.len() > 1 { b |= (chunk[1] as u32) << 8; }
+        if chunk.len() > 2 { b |= chunk[2] as u32; }
+        result.push(CHARSET[(b >> 18 & 0x3F) as usize] as char);
+        result.push(CHARSET[(b >> 12 & 0x3F) as usize] as char);
+        if chunk.len() > 1 { result.push(CHARSET[(b >> 6 & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 2 { result.push(CHARSET[(b & 0x3F) as usize] as char); } else { result.push('='); }
+    }
+    result
+}
+
+pub async fn start_webdav_server(fs: MirageFS, port: u16, user: String, pass: String) {
+    let fs_arc = Arc::new(Mutex::new(fs));
+    let dav_fs = MirageWebDav { fs: fs_arc.clone() };
+
     let dav_server = DavHandler::builder()
-        .filesystem(Box::new(MirageWebDav::new(fs)))
+        .filesystem(Box::new(dav_fs))
         .locksystem(FakeLs::new())
         .build_handler();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("🌐 WebDAV Server running at http://{}/", addr);
-    println!(
-        "   -> Connect via Browser for UI: http://127.0.0.1:{}",
-        port
-    );
-    println!(
-        "   -> Connect via WebDAV Client:  http://127.0.0.1:{}",
-        port
-    );
+    println!("🌐 MirageFS Web Console: http://{}/", addr);
+    println!("   -> Credentials: {} / [carrier password]", user);
+
+    let expected_auth = format!("Basic {}", base64_encode(&format!("{}:{}", user, pass)));
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
@@ -596,12 +606,29 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
         let (stream, _) = listener.accept().await.unwrap();
         let io = hyper_util::rt::TokioIo::new(stream);
         let dav_server = dav_server.clone();
+        let fs_arc = fs_arc.clone();
+        let expected_auth = expected_auth.clone();
 
         tokio::task::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let dav_server = dav_server.clone();
+                let fs_arc = fs_arc.clone();
+                let expected_auth = expected_auth.clone();
+
                 async move {
-                    // Simple Route: If GET /, serve HTML UI. Else, WebDAV.
+                    let auth_header = req.headers().get(hyper::header::AUTHORIZATION);
+                    let auth_ok = auth_header.map(|h| h.to_str().unwrap_or("")) == Some(&expected_auth);
+
+                    if !auth_ok {
+                        return Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header("WWW-Authenticate", "Basic realm=\"MirageFS Secure Sector\"")
+                                .body(Body::from(Bytes::from("401 Unauthorized - Identification Required")))
+                                .unwrap(),
+                        );
+                    }
+
                     if req.method() == Method::GET && req.uri().path() == "/" {
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
@@ -615,6 +642,19 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16) {
                             hyper::Response::builder()
                                 .header("Content-Type", "application/json")
                                 .body(Body::from(Bytes::from(url_metrics_json())))
+                                .unwrap(),
+                        );
+                    }
+                    if req.method() == Method::GET && req.uri().path() == "/__stats" {
+                        let stats_json = tokio::task::spawn_blocking(move || {
+                            let locked_fs = fs_arc.lock().unwrap();
+                            locked_fs.get_stats_json()
+                        }).await.unwrap();
+
+                        return Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("Content-Type", "application/json")
+                                .body(Body::from(Bytes::from(stats_json)))
                                 .unwrap(),
                         );
                     }

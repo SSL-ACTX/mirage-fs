@@ -59,6 +59,10 @@ struct Cli {
     port: u16,
     #[arg(long, help = "Mount as read-only (also implied for URL media)")]
     read_only: bool,
+    #[arg(long, help = "Username for WebDAV (default: admin)")]
+    user: Option<String>,
+    #[arg(long, help = "Password for WebDAV (default: carrier password)")]
+    pass: Option<String>,
 }
 
 fn print_banner() {
@@ -214,7 +218,9 @@ fn main() -> anyhow::Result<()> {
     // --- Launch Mode Selection ---
 
     if cli.webdav {
-        return run_webdav(fs, cli.port);
+        let web_user = cli.user.unwrap_or_else(|| "admin".to_string());
+        let web_pass = cli.pass.unwrap_or_else(|| password.clone());
+        return run_webdav(fs, cli.port, web_user, web_pass);
     }
 
     #[cfg(all(feature = "fuse", unix))]
@@ -225,18 +231,20 @@ fn main() -> anyhow::Result<()> {
     #[cfg(not(all(feature = "fuse", unix)))]
     {
         info!("MirageFS compiled without FUSE support. Defaulting to WebDAV.");
-        run_webdav(fs, cli.port)
+        let web_user = cli.user.unwrap_or_else(|| "admin".to_string());
+        let web_pass = cli.pass.unwrap_or_else(|| password.clone());
+        run_webdav(fs, cli.port, web_user, web_pass)
     }
 }
 
 // --- Mode Implementations ---
 
-fn run_webdav(fs: MirageFS, port: u16) -> anyhow::Result<()> {
+fn run_webdav(fs: MirageFS, port: u16, user: String, pass: String) -> anyhow::Result<()> {
     info!("Starting WebDAV Mode (FUSE Disabled)...");
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        webdav_server::start_webdav_server(fs, port).await;
+        webdav_server::start_webdav_server(fs, port, user, pass).await;
     });
 
     Ok(())

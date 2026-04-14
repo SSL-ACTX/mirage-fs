@@ -895,6 +895,24 @@ impl MirageFS {
         }
         0
     }
+
+    pub fn get_stats_json(&self) -> String {
+        let total_blocks = self.disk.block_count();
+        let used_blocks = self.block_owner.len() as u64;
+        let free_blocks = total_blocks.saturating_sub(used_blocks).saturating_sub(self.metadata_blocks_reserved as u64);
+
+        format!(
+            "{{\"total_size\":{},\"used_size\":{},\"free_size\":{},\"inode_count\":{},\"next_inode\":{},\"metadata_reserved\":{},\"read_only\":{},\"freeze_timestamps\":{}}}",
+            total_blocks * BLOCK_SIZE as u64,
+            used_blocks * BLOCK_SIZE as u64,
+            free_blocks * BLOCK_SIZE as u64,
+            self.inodes.len(),
+            self.next_inode,
+            self.metadata_blocks_reserved,
+            self.read_only,
+            self.freeze_timestamps
+        )
+    }
 }
 
 // FUSE Adapter Layer (Feature Gated)
