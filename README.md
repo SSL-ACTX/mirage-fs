@@ -176,19 +176,20 @@ You can access the new graphical interface by opening the server address in any 
 
 **Link:** `http://127.0.0.1:8080` (Default)
 
-* **Drag & Drop:** Upload files instantly.
-* **Manage:** Create folders, delete items, and browse your hidden filesystem.
-* **Metrics:** `http://127.0.0.1:8080/__metrics`
+* **Authentication:** Secured with **Basic Auth**. Use `--user` and `--pass` to customize (Default: `admin` / your carrier password).
+* **System Dashboard:** A new real-time status dashboard showing filesystem health, block usage, and carrier integrity.
+* **File Management:** Full support for **Search**, **Instant Rename**, and improved folder navigation.
+* **Drag & Drop:** Upload files instantly to your hidden drive.
+* **Stats & Metrics:** Real-time JSON data via `/__stats` (Filesystem) and `/__metrics` (Network/Carrier).
+* **Security:** All web access is now protected by **Basic Authentication**.
 
 ### 4. WebDAV Mode (Manual / Network Share)
 
-You can force WebDAV mode (bypassing FUSE) to mount the drive as a Network Share. This is useful for systems without FUSE drivers.
+You can force WebDAV mode (bypassing FUSE) to mount the drive as a Network Share. This is useful for systems without FUSE drivers or for remote access.
 
 ```bash
-# Start Server on Port 8080
-mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
-
-
+# Start Server on Port 8080 with custom credentials
+mirage /mnt/point cover.png movie.mp4 --webdav --port 8080 --user myuser --pass mysecret
 ```
 
 **How to Access:**
@@ -197,6 +198,9 @@ mirage /mnt/point cover.png movie.mp4 --webdav --port 8080
 * **macOS:** Finder -> Go -> Connect to Server (`Cmd+K`) -> `http://127.0.0.1:8080`
 * **Linux (GNOME/Nautilus):** Files App -> Other Locations -> Connect to Server -> `dav://127.0.0.1:8080`
 * **Linux (CLI):** `mount -t davfs http://127.0.0.1:8080 /mnt/mountpoint`
+
+> [!NOTE]
+> When mounting as a network drive, your OS will prompt for the **Username** and **Password** configured via the CLI (Default: `admin` and your encryption password).
 
 > [!NOTE]
 > Visiting the root URL (`http://127.0.0.1:8080`) in a browser loads the **Web UI**. To mount the filesystem as a native drive in your OS, you must use the "Connect to Server" / "Map Network Drive" feature of your file manager, not a web browser.
