@@ -18,7 +18,7 @@
 
 ## Overview
 
-**MirageFS** is a high-stealth steganographic filesystem built in Rust. It allows you to format and mount standard media files (`.png`, `.jpg`, `.webp`, `.mp4`, `.mov`) as fully functional read/write drives.
+**MirageFS** is a high-stealth steganographic filesystem built in Rust. It allows you to format and mount standard media files (`.png`, `.jpg`, `.webp`, `.mp4`, `.mov`, `.mp3`) as fully functional read/write drives.
 
 Unlike traditional steganography tools that simply hide a static payload, MirageFS implements a **virtual block device** inside the media. This means you can interact with your hidden files in real-time using your OS's native file explorer (`cp`, `mv`, `vim`, `mkdir`, `rmdir`, etc.) without extracting them first.
 
@@ -29,6 +29,16 @@ Your data is secured with state-of-the-art authenticated encryption.
 * **Cipher:** **XChaCha20-Poly1305** (Extended Nonce + MAC authentication).
 * **KDF:** **Argon2id** (Resistant to GPU/ASIC brute-force attacks).
 * **Nonce Randomization:** Every block write generates a unique nonce; writing the same file twice produces completely different ciphertext.
+
+### Playlist RAID & Folder Support
+MirageFS supports **Playlist Leveling**, allowing you to treat an entire album or folder of media files as a single logical drive.
+* **Smart JBOD:** Instead of passing files individually, point MirageFS to a folder of MP3s or photos. It will automatically expand and pool them into a RAID array.
+* **Capacity Pooling:** Transparently slice large files across multiple carrier files in a folder.
+
+### Integrated Cloud Uploader
+MirageFS now includes a built-in cloud uploader powered by `srapi-rs` to share your hidden carriers anonymously.
+* **Anonymous Hosting:** Upload carrier files to **Filebin**, **Temp.sh**, **Tmpfiles.org**, or **Jumpshare** directly from the CLI.
+* **Automated Binning:** Automatically create buckets/bins for your uploads and receive shareable URLs instantly.
 
 ### Embedded Web Interface
 MirageFS now ships with a stunning, self-hosted **Web Management UI** served directly from the binary.
@@ -61,6 +71,7 @@ MirageFS employs distinct, format-optimized strategies to defeat forensic analys
 
 | Media Format | Strategy | Stealth Technique |
 | :--- | :--- | :--- |
+| **MP3** | **Phantom-Sync Engine** | Injects data into `APIC` tags using **Sync-Safe Base128** encoding. This mathematically prevents audio glitches by ensuring no MP3 "Sync Words" are generated in the payload. |
 | **MP4 / MOV** | **Shadow `mdat` Injection** | Appends a secondary `mdat` atom ignored by standard players. Data is encapsulated in valid **H.264 NAL Units** (Type 12 "Filler Data") to look like video stream padding. |
 | **PNG** | **Feistel Bijective Mapping** | Uses a **Feistel Network** and **Cycle Walking** to map logical blocks to physical pixels in $O(1)$ time. Salt locations are derived from the password. |
 | **JPEG** | **DNG Morphing** | Data is injected into `APP1` segments mimicking valid **Adobe DNG Private Data** (Tag `0xC634`) inside a standard TIFF structure. |
@@ -212,9 +223,36 @@ To close the drive and flush all data:
 * **Press** `Ctrl + C` in the terminal.
 * **Or run:** `fusermount -u /tmp/secret` (FUSE mode only)
 
+### 6. Cloud Uploading (Anonymous Sharing)
+
+Share your hidden carriers by uploading them to anonymous file hosting providers directly from MirageFS.
+
+```bash
+# Upload a single file to temp.sh (default)
+mirage upload ./carrier.mp3
+
+# Upload an entire folder of carriers to Filebin
+# If no --bin-id is provided, a new one will be created automatically.
+mirage upload --provider filebin ./album_folder/
+
+# Upload to Jumpshare
+mirage upload --provider jumpshare ./video_carrier.mp4
+```
+
+**Supported Providers:** `temp-sh`, `tmpfiles`, `jumpshare`, `filebin`.
+
 ---
 
 ## Technical Deep Dive
+
+### MP3 "Phantom-Sync" Engine
+
+The MP3 format presents a unique challenge: encrypted ciphertext can accidentally generate the 12-bit "Sync Word" (`0xFFE`), causing audio decoders to crash or produce horrific static.
+
+1. **Sync-Safe Encoding:** MirageFS passes all encrypted blocks through a **Base128 (Sync-Safe) expander**. By forcing the Most Significant Bit (MSB) of every byte to `0`, we mathematically guarantee that the byte `0xFF` can **never** exist in the payload, ensuring 100% glitch-free playback.
+2. **Metadata Morphing:** The encoded payload is hidden within a massive **ID3v2 `APIC` (Attached Picture)** frame. 
+3. **Camouflage:** To forensic scanners, the high-entropy data is justified by a fake **JPEG header**, making the payload appear to be a large, possibly corrupted, high-resolution album cover.
+4. **VBR Spoofing:** MirageFS locates and updates the `Xing` or `Info` VBR headers to lock the track duration, ensuring the media player's seek bar remains accurate and unaffected by the injected data.
 
 ### MP4 "Shadow Injection" Engine
 

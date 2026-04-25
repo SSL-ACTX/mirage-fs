@@ -39,8 +39,7 @@ pub struct MirageWebDav {
     fs: Arc<Mutex<MirageFS>>,
 }
 
-impl MirageWebDav {
-}
+impl MirageWebDav {}
 
 #[derive(Clone, Debug)]
 pub struct MirageMetaData {
@@ -534,8 +533,9 @@ impl DavFileSystem for MirageWebDav {
                             return Err(libc::EIO);
                         }
 
-                        let written =
-                            locked_fs.write_data_internal(dest_ino, offset, &data).map_err(|_| libc::EIO)?;
+                        let written = locked_fs
+                            .write_data_internal(dest_ino, offset, &data)
+                            .map_err(|_| libc::EIO)?;
                         if written != data.len() {
                             return Err(libc::EIO);
                         }
@@ -575,12 +575,24 @@ fn base64_encode(input: &str) -> String {
     let bytes = input.as_bytes();
     for chunk in bytes.chunks(3) {
         let mut b = (chunk[0] as u32) << 16;
-        if chunk.len() > 1 { b |= (chunk[1] as u32) << 8; }
-        if chunk.len() > 2 { b |= chunk[2] as u32; }
+        if chunk.len() > 1 {
+            b |= (chunk[1] as u32) << 8;
+        }
+        if chunk.len() > 2 {
+            b |= chunk[2] as u32;
+        }
         result.push(CHARSET[(b >> 18 & 0x3F) as usize] as char);
         result.push(CHARSET[(b >> 12 & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(CHARSET[(b >> 6 & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(CHARSET[(b & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 1 {
+            result.push(CHARSET[(b >> 6 & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARSET[(b & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
     result
 }
@@ -617,14 +629,20 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16, user: String, pass: St
 
                 async move {
                     let auth_header = req.headers().get(hyper::header::AUTHORIZATION);
-                    let auth_ok = auth_header.map(|h| h.to_str().unwrap_or("")) == Some(&expected_auth);
+                    let auth_ok =
+                        auth_header.map(|h| h.to_str().unwrap_or("")) == Some(expected_auth.as_str());
 
                     if !auth_ok {
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
                                 .status(StatusCode::UNAUTHORIZED)
-                                .header("WWW-Authenticate", "Basic realm=\"MirageFS Secure Sector\"")
-                                .body(Body::from(Bytes::from("401 Unauthorized - Identification Required")))
+                                .header(
+                                    "WWW-Authenticate",
+                                    "Basic realm=\"MirageFS Secure Sector\"",
+                                )
+                                .body(Body::from(Bytes::from(
+                                    "401 Unauthorized - Identification Required",
+                                )))
                                 .unwrap(),
                         );
                     }
@@ -649,7 +667,9 @@ pub async fn start_webdav_server(fs: MirageFS, port: u16, user: String, pass: St
                         let stats_json = tokio::task::spawn_blocking(move || {
                             let locked_fs = fs_arc.lock().unwrap();
                             locked_fs.get_stats_json()
-                        }).await.unwrap();
+                        })
+                        .await
+                        .unwrap();
 
                         return Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()

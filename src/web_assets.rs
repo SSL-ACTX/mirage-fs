@@ -1,5 +1,6 @@
 // src/web_assets.rs
 
+#[allow(dead_code)]
 pub const HTML: &str = r#"
 <!DOCTYPE html>
 <html lang="en">
