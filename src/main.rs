@@ -73,6 +73,7 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Commands {
     /// Upload carrier files to a cloud provider
+    #[cfg(feature = "cloud")]
     Upload {
         #[arg(short, long, default_value = "temp-sh")]
         provider: String,
@@ -133,6 +134,7 @@ fn main() -> anyhow::Result<()> {
     // Handle Subcommands
     if let Some(command) = cli.command {
         match command {
+            #[cfg(feature = "cloud")]
             Commands::Upload { provider, bin_id, files } => {
                 return upload_to_cloud(provider, bin_id, files);
             }
@@ -304,6 +306,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "cloud")]
 fn upload_to_cloud(provider_name: String, mut bin_id: Option<String>, files: Vec<String>) -> anyhow::Result<()> {
     info!("Initializing Cloud Uploader ({})", provider_name);
 

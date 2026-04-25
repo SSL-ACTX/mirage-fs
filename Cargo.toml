@@ -4,9 +4,10 @@ version = "1.6.0"
 edition = "2021"
 
 [features]
-default = ["webdav"]
+default = ["webdav", "cloud"]
 webdav = []
 fuse = ["dep:fuser"]
+cloud = ["dep:srapi-rs", "dep:async-trait"]
 
 [target.'cfg(unix)'.dependencies]
 fuser = { version = "0.16", optional = true }
@@ -17,7 +18,7 @@ env_logger = "0.10"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 rand = "0.8.5"
-async-trait = "0.1"
+async-trait = { version = "0.1", optional = true }
 chacha20poly1305 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
@@ -35,7 +36,7 @@ headers = "0.3"
 hyper = "1.8.1"
 bytes = "1.11.1"
 futures = "0.3.31"
-srapi-rs = { path = "src/srapi-rs" }
+srapi-rs = { path = "src/srapi-rs", optional = true }
 hyper-util = { version = "0.1.19", features = ["tokio", "server", "server-auto", "http1"] }
 http-body-util = "0.1.3"
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
