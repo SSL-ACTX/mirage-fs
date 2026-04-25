@@ -164,7 +164,7 @@ pub fn open_media_url(url: &str, password: &str) -> anyhow::Result<Box<dyn Block
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(Policy::limited(10))
-        .user_agent("MirageFS/1.5.0")
+        .user_agent("MirageFS/1.6.0")
         .build()?;
 
     let resolved_url = resolve_media_url(&client, &url, 8)?;

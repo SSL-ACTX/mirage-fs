@@ -48,7 +48,7 @@ pub const HTML: &str = r#"
             </button>
             <div class="hidden md:flex items-center gap-2 text-xs font-medium text-zinc-500 bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-full">
                 <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                v1.5.0
+                v1.6.0
             </div>
         </div>
     </header>

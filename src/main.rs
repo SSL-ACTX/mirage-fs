@@ -38,7 +38,7 @@ use webp_disk::WebPDisk;
 #[derive(Parser)]
 #[command(name = "MirageFS")]
 #[command(author = "Seuriin (Github: SSL-ACTX)")]
-#[command(version = "1.5.0")]
+#[command(version = "1.6.0")]
 #[command(
     about = "High-Stealth Steganographic Filesystem",
     long_about = "MirageFS mounts an encrypted filesystem inside standard image/video files."
@@ -90,7 +90,7 @@ fn print_banner() {
     ██ ▀▀ ██ ██ ██▄█▄ ██▀██ ██ ▄▄ ██▄▄  ██▄▄   ▀▀▀▄▄▄
     ██    ██ ██ ██ ██ ██▀██ ▀███▀ ██▄▄▄ ██     █████▀
 
-    v1.5.0 | By Seuriin (SSL-ACTX)
+    v1.6.0 | By Seuriin (SSL-ACTX)
     "#
     );
 }

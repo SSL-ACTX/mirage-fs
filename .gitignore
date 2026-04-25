@@ -2,7 +2,9 @@ bak/
 test/
 tests/
 target/
+tmp/
 
+*.mp3
 *.jpeg
 *.jpg
 *.png

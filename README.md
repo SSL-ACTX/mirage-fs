@@ -3,7 +3,7 @@
 ![MirageFS Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:FF4500&height=220&section=header&text=MirageFS&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=2&stroke=FF4500&strokeWidth=2&desc=The%20Invisible%20Filesystem&descSize=20&descAlignY=60)
 
 
-![Version](https://img.shields.io/badge/version-1.5.0-blue.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.6.0-blue.svg?style=for-the-badge)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/license-AGPL_3.0-green.svg?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg?style=for-the-badge&logo=linux)
@@ -334,6 +334,6 @@ MirageFS works perfectly on Windows via the new <strong>WebDAV Mode</strong>.
 
 **Author:** Seuriin ([SSL-ACTX](https://github.com/SSL-ACTX))
 
-*v1.5.0*
+*v1.6.0*
 
 </div>
